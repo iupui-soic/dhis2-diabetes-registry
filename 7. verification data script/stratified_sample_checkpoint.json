@@ -1,0 +1,44 @@
+{
+  "completed_groups": {
+    "wearable": true,
+    "glucose": true,
+    "environmental": true,
+    "diagnosis": true,
+    "retinal_photography": true,
+    "retinal_octa": true,
+    "ecg": true
+  },
+  "results": {
+    "wearable": {
+      "checked": 1331108,
+      "matched": 1331108,
+      "skipped": 0
+    },
+    "glucose": {
+      "checked": 1138040,
+      "matched": 1136962
+    },
+    "environmental": {
+      "checked": 4458870,
+      "matched": 4458863,
+      "nox_events_not_verified": 120506
+    },
+    "diagnosis": {
+      "checked": 8250,
+      "matched": 8250
+    },
+    "retinal_photography": {
+      "checked": 185895,
+      "matched": 185895
+    },
+    "retinal_octa": {
+      "checked": 500,
+      "matched": 500
+    },
+    "ecg": {
+      "checked": 0,
+      "matched": 0,
+      "note": "ECG source structure not traced; skipped"
+    }
+  }
+}
