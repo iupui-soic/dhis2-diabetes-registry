@@ -1,0 +1,14 @@
+# pip install -r requirements.txt
+#
+# pylibjpeg and pylibjpeg-libjpeg are not optional. Without them pydicom
+# cannot decode the Heidelberg Spectralis JPEG transfer syntax, and the
+# retinal import silently produces empty previews. That is what left 4,680
+# images blank on the first full run, and nothing declared the dependency.
+
+requests>=2.31,<3
+pandas>=2.0,<3
+numpy>=1.24,<3
+pydicom>=2.4,<4
+pylibjpeg>=2.0
+pylibjpeg-libjpeg>=2.0
+Pillow>=10.0

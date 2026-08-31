@@ -1,134 +1,96 @@
 #!/usr/bin/env python3
+"""Count participants with gradable retinal photography AND >=7 days of CGM.
+
+Fills the abstract's [C] cohort size and [t] query time placeholders.
+
+READ-ONLY. GET requests only, using the auditor account.
+
+WHAT THE AUDIT FOUND (C-01, H-06, H-13), and what changed
+----------------------------------------------------------
+Credentials come from the environment rather than being read from two
+undocumented variables. metadata_uids, which this script imported and which
+was never committed, now lives in common/. The paging loops raise on an HTTP
+error instead of returning an empty list that reads as "this participant has
+no events", which would have quietly shrunk the cohort.
+
+The original pagination bug this file's own header describes, judging seven
+distinct days from whatever happened to be on page one, is fixed by
+dhis2.fetch_all_pages.
+
+USAGE
+-----
+    python3 "7. verification data script/cohort_query_gradable_cgm.py"
 """
-cohort_query_gradable_cgm.py  (v3 — fixes a pagination bug)
 
-Fills the abstract's [C] and [t] placeholders.
-
-BUG FOUND AND FIXED IN THIS VERSION
----------------------------------------
-The diagnostic dump showed CGM-Glucose returning exactly 50 events for
-a participant known to have months of hourly CGM data — that's DHIS2's
-default page size, not a true total. The original has_min_cgm_days()
-never paginated, so it silently judged "at least 7 distinct days" from
-whatever arbitrary slice of events happened to be on page 1 — almost
-certainly why every participant came back as failing the CGM-coverage
-check, producing a cohort of 0. This version paginates fully for both
-checks before deciding.
-
-SAFETY / READ-ONLY GUARANTEE
------------------------------
-GET requests only. No writes. Same as every other script in this set.
-"""
-
+import argparse
 import os
+import sys
 import time
-import requests
 
-import metadata_uids as M
-
-BASE_URL = "https://t2d-registry.plhi.us"
-
-AUDITOR_USER = os.environ["DHIS2_AUDITOR_USER"]
-AUDITOR_PASS = os.environ["DHIS2_AUDITOR_PASS"]
-
-SESSION = requests.Session()
-SESSION.auth = (AUDITOR_USER, AUDITOR_PASS)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
 
 MIN_CGM_DAYS = 7
-PAGE_SIZE = 200  # explicit, rather than trusting the server default
 
 
-def get_all_participants():
-    participants, page = [], 1
-    while True:
-        r = SESSION.get(
-            f"{BASE_URL}/api/tracker/trackedEntities",
-            params={"program": M.PROGRAM_UID, "fields": "trackedEntity",
-                    "page": page, "pageSize": PAGE_SIZE},
-            timeout=30,
-        )
-        r.raise_for_status()
-        batch = r.json().get("trackedEntities", [])
-        if not batch:
-            break
-        participants.extend(t["trackedEntity"] for t in batch)
-        page += 1
-    return participants
-
-
-def get_all_events_for_participant(person_uid, stage_uid, fields):
-    """Paginates fully — do not trust a single unpaginated call, as
-    confirmed necessary by the diagnostic dump (CGM-Glucose silently
-    truncated to 50 events without this)."""
-    all_events = []
-    page = 1
-    while True:
-        r = SESSION.get(
-            f"{BASE_URL}/api/tracker/events",
-            params={
-                "program": M.PROGRAM_UID,
-                "programStage": stage_uid,
-                "trackedEntity": person_uid,
-                "fields": fields,
-                "page": page,
-                "pageSize": PAGE_SIZE,
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        batch = r.json().get("events", [])
-        if not batch:
-            break
-        all_events.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break  # last page
-        page += 1
-    return all_events
-
-
-def has_gradable_photography(person_uid):
-    events = get_all_events_for_participant(
-        person_uid, M.RETINAL_PHOTOGRAPHY_STAGE_UID, "dataValues"
+def has_gradable_photography(session, registry, tei_uid):
+    preview_de = M.RETINAL_PHOTOGRAPHY_FIELD_UIDS["preview"]
+    events = dhis2.fetch_events(
+        session, M.PROGRAM_UID, registry.stage("Retinal Photography"), tei_uid,
+        fields="event,dataValues[dataElement,value]",
     )
     for event in events:
         for dv in event.get("dataValues", []):
-            if dv.get("dataElement") == M.RETINAL_PHOTOGRAPHY_PREVIEW_DE and dv.get("value"):
+            if dv.get("dataElement") == preview_de and dv.get("value"):
                 return True
     return False
 
 
-def has_min_cgm_days(person_uid, min_days=MIN_CGM_DAYS):
-    events = get_all_events_for_participant(
-        person_uid, M.CGM_GLUCOSE_STAGE_UID, "occurredAt"
+def cgm_day_count(session, registry, tei_uid):
+    events = dhis2.fetch_events(
+        session, M.PROGRAM_UID, registry.stage("CGM - Glucose"), tei_uid,
+        fields="event,occurredAt",
     )
-    distinct_days = {e["occurredAt"][:10] for e in events if e.get("occurredAt")}
-    return len(distinct_days) >= min_days
+    return len({e["occurredAt"][:10] for e in events if e.get("occurredAt")})
 
 
 def main():
-    print("Assembling cohort: gradable photography AND >=7 days CGM coverage...")
-    print(f"(paginating fully, pageSize={PAGE_SIZE}, per participant per stage)\n")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--min-cgm-days", type=int, default=MIN_CGM_DAYS)
+    args, _ = parser.parse_known_args()
+
+    session = dhis2.get_session(read_only=True)
+    registry = M.load(session)
+
+    print(f"Assembling cohort: gradable photography AND >={args.min_cgm_days} "
+          f"days of CGM coverage")
     start = time.perf_counter()
 
-    participants = get_all_participants()
-    print(f"  Total participants in registry: {len(participants)}")
+    participants = dhis2.fetch_all_pages(
+        session, "tracker/trackedEntities",
+        {"program": M.PROGRAM_UID, "fields": "trackedEntity"},
+        ("trackedEntities", "instances"),
+    )
+    print(f"  participants in the registry: {len(participants)}")
 
-    matching = []
-    for i, person_uid in enumerate(participants):
-        if has_gradable_photography(person_uid) and has_min_cgm_days(person_uid):
-            matching.append(person_uid)
-        if (i + 1) % 100 == 0:
-            print(f"  ...checked {i + 1}/{len(participants)}  (matches so far: {len(matching)})")
-        time.sleep(0.02)
+    matching = 0
+    for index, item in enumerate(participants, start=1):
+        tei_uid = item["trackedEntity"]
+        if (has_gradable_photography(session, registry, tei_uid)
+                and cgm_day_count(session, registry, tei_uid) >= args.min_cgm_days):
+            matching += 1
+        if index % 100 == 0:
+            print(f"  checked {index}/{len(participants)}, matches {matching}")
 
     elapsed = time.perf_counter() - start
-
     print("\n" + "=" * 60)
-    print("FINAL SUMMARY — fill these directly into the abstract:")
-    print(f"  Cohort size (C): {len(matching)} participants")
+    print("Fill these into the abstract:")
+    print(f"  Cohort size (C): {matching} participants")
     print(f"  Query time (t):  {elapsed:.1f} s")
     print("=" * 60)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

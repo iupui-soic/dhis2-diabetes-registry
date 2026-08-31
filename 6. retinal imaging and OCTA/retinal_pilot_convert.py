@@ -30,88 +30,38 @@ import sys
 import argparse
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-from PIL import Image
 
-try:
-    import pydicom
-except ImportError:
-    sys.exit(
-        "pydicom is required. Install it with:\n"
-        "    pip install pydicom --user\n"
-    )
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dicom  # noqa: E402
 
-AI_READI_ROOT = os.path.expanduser("~/AI-READI-fixed")
-PHOTOGRAPHY_DIR = os.path.join(AI_READI_ROOT, "retinal_photography")
-OCTA_DIR = os.path.join(AI_READI_ROOT, "retinal_octa")
+import pydicom  # noqa: E402  (common.dicom already reported a clear error if absent)
 
-MAX_DIMENSION = 800  # resize longest side to this many pixels
-JPEG_QUALITY = 85
+# M-06: the conversion lives in common.dicom now. This file used to carry its
+# own copy, which never learned to handle the YBR colorspace, so previews
+# generated here would have looked different from the ones the import wrote.
 
-
-def dicom_to_preview_array(ds):
-    """
-    Extract a normalized 8-bit 2D array from a pydicom Dataset, handling:
-      - single-frame vs multi-frame (volumetric) DICOM -> take middle frame
-      - rescale slope/intercept if present
-      - normalization to 0-255 for JPEG export
-    """
-    pixel_array = ds.pixel_array
-
-    # Multi-frame (volumetric) DICOM: pixel_array shape is (frames, H, W) or
-    # (frames, H, W, channels). Take the middle frame as the representative slice.
-    if pixel_array.ndim >= 3 and getattr(ds, "NumberOfFrames", 1) and int(getattr(ds, "NumberOfFrames", 1)) > 1:
-        num_frames = pixel_array.shape[0]
-        middle_idx = num_frames // 2
-        frame = pixel_array[middle_idx]
-    else:
-        frame = pixel_array
-
-    frame = frame.astype(np.float64)
-
-    # Apply DICOM rescale slope/intercept if present (common for OCT/OCTA)
-    slope = float(getattr(ds, "RescaleSlope", 1))
-    intercept = float(getattr(ds, "RescaleIntercept", 0))
-    frame = frame * slope + intercept
-
-    # Normalize to 0-255 based on this frame's own min/max
-    fmin, fmax = frame.min(), frame.max()
-    if fmax > fmin:
-        frame = (frame - fmin) / (fmax - fmin) * 255.0
-    else:
-        frame = np.zeros_like(frame)
-
-    frame = frame.astype(np.uint8)
-    return frame
+MAX_DIMENSION = dicom.MAX_DIMENSION
+JPEG_QUALITY = dicom.JPEG_QUALITY
 
 
 def save_preview(ds, out_path):
-    arr = dicom_to_preview_array(ds)
-
-    if arr.ndim == 2:
-        img = Image.fromarray(arr).convert("L")  # grayscale
-    elif arr.ndim == 3 and arr.shape[-1] == 3:
-        img = Image.fromarray(arr).convert("RGB")
-    else:
-        # Fallback: squeeze/convert whatever shape shows up
-        img = Image.fromarray(np.squeeze(arr)).convert("L")
-
-    # Resize keeping aspect ratio, longest side = MAX_DIMENSION
-    img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
-
+    """Convert and write one preview, using the shared conversion."""
+    img = dicom.to_image(ds)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, "JPEG", quality=JPEG_QUALITY)
     return out_path, img.size
 
 
-def process_manifest(manifest_path, filepath_col, person_id, out_dir, label, limit=None):
+def process_manifest(manifest_path, filepath_col, person_id, out_dir, label, modality, limit=None):
     print(f"\n=== {label} ===")
-    if not os.path.exists(manifest_path):
-        print(f"  [skip] manifest not found: {manifest_path}")
+    try:
+        resolved_manifest = aireadi.manifest_path(manifest_path)
+    except FileNotFoundError as exc:
+        print(f"  [skip] {exc}")
         return
 
-    df = pd.read_csv(manifest_path, sep="\t")
+    df = pd.read_csv(resolved_manifest, sep="\t")
     df["person_id"] = df["person_id"].astype(str)
     rows = df[df["person_id"] == str(person_id)]
     print(f"  {len(rows)} rows for person_id={person_id}")
@@ -128,9 +78,9 @@ def process_manifest(manifest_path, filepath_col, person_id, out_dir, label, lim
             skipped += 1
             continue
         # manifest paths are stored with a leading slash relative to AI_READI_ROOT
-        full_path = os.path.join(AI_READI_ROOT, rel_path.lstrip("/"))
-        if not os.path.exists(full_path):
-            print(f"  [warn] file not found, skipping: {full_path}")
+        full_path = aireadi.resolve(modality, rel_path)
+        if full_path is None:
+            print(f"  [warn] file not found, skipping: {rel_path}")
             failed += 1
             continue
         try:
@@ -162,20 +112,22 @@ def main():
     print(f"Output directory: {args.out_dir}")
 
     process_manifest(
-        manifest_path=os.path.join(PHOTOGRAPHY_DIR, "manifest.tsv"),
+        manifest_path="retinal_photography",
         filepath_col="filepath",
         person_id=args.person_id,
         out_dir=args.out_dir,
         label="retinal_photography",
+        modality="retinal_photography",
         limit=args.limit_per_category,
     )
 
     process_manifest(
-        manifest_path=os.path.join(OCTA_DIR, "manifest.tsv"),
+        manifest_path="retinal_octa",
         filepath_col="associated_enface_1_file_path",
         person_id=args.person_id,
         out_dir=args.out_dir,
         label="retinal_octa_enface",
+        modality="retinal_octa",
         limit=args.limit_per_category,
     )
 

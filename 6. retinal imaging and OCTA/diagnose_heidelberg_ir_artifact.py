@@ -10,17 +10,20 @@ mishandling.
 """
 
 import os
+import sys
 import numpy as np
-import pydicom
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dicom  # noqa: E402  (reports a clear error if pydicom is absent)
 
-AI_READI_ROOT = os.path.expanduser("~/AI-READI-fixed")
+import pydicom  # noqa: E402
+
 
 TARGET_FILE = "retinal_photography/ir/heidelberg_spectralis/1158/1158_spectralis_ppol_mac_hr_oct_ir_l_1.3.6.1.4.1.33437.11.4.9341142.116784484712349.29141.4.0.0.dcm"
 
-full_path = os.path.join(AI_READI_ROOT, TARGET_FILE.lstrip("/"))
+full_path = aireadi.resolve("retinal_photography", TARGET_FILE)
 
-if not os.path.exists(full_path):
-    print(f"File not found: {full_path}")
+if full_path is None:
+    print(f"File not found: {TARGET_FILE}")
 else:
     ds = pydicom.dcmread(full_path)
     print(f"File: {full_path}\n")

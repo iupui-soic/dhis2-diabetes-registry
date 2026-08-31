@@ -1,104 +1,80 @@
-"""
-Step 1:
-  - Renames 4 existing glucose fields for clarity (device-only vs combined
-    clinical threshold), WITHOUT touching any stored data - renaming a
-    data element only changes its display label.
-  - Creates 2 new fields: Above Range Count (>180) and Below Range Count
-    (<70), to pair with the (already renamed) Above/Below Range Timestamps.
+#!/usr/bin/env python3
+"""Rename the glucose sentinel fields and add the clinical range counts.
 
-Run once. Prints the 2 new count field UIDs at the end.
+Renames, so the device-only concept is distinguishable from the clinical one:
+  High Reading Count               -> Device High Count
+  Low Reading Count                -> Device Low Count
+  Glucose High Reading Timestamps  -> Above Range Timestamps (>180 mg/dL)
+  Glucose Low Reading Timestamps   -> Below Range Timestamps (<70 mg/dL)
+
+Creates:
+  Above Range Count (>180 mg/dL)
+  Below Range Count (<70 mg/dL)
+
+Renaming a data element changes only its label. No stored value is touched.
+
+WHAT THE AUDIT FOUND (C-01, H-07, M-04), and what changed
+----------------------------------------------------------
+Credentials come from the environment. The rename used GET fields=* followed
+by a full PUT, which risks dropping any property the response omitted; it now
+sends a targeted PATCH. Creation verifies its own result rather than trusting
+the status code.
 """
 
-import requests
 import json
+import os
+import sys
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
 
-GLUCOSE_STAGE_UID = 'SS7a20eCnBZ'
+RENAMES = [
+    ("RZpt03lifR6", "Device High Count", "Device High Count"),
+    ("hi1TAwCqN0f", "Device Low Count", "Device Low Count"),
+    ("Zu4iFxtthSU", "Above Range Timestamps (>180 mg/dL)", "Above Range Timestamps"),
+    ("LfzwHxQUotL", "Below Range Timestamps (<70 mg/dL)", "Below Range Timestamps"),
+]
 
-# Existing field UIDs to rename
-RZpt03lifR6 = 'RZpt03lifR6'  # currently "High Reading Count"
-hi1TAwCqN0f = 'hi1TAwCqN0f'  # currently "Low Reading Count"
-Zu4iFxtthSU = 'Zu4iFxtthSU'  # currently "Glucose High Reading Timestamps"
-LfzwHxQUotL = 'LfzwHxQUotL'  # currently "Glucose Low Reading Timestamps"
-
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
-headers = {'Content-Type': 'application/json'}
-
-
-def rename_data_element(uid, new_name, new_short_name):
-    de = session.get(f'{DHIS2_URL}/api/dataElements/{uid}', params={'fields': '*'}).json()
-    de['name'] = new_name
-    de['shortName'] = new_short_name[:50]
-    resp = session.put(f'{DHIS2_URL}/api/dataElements/{uid}', headers=headers, data=json.dumps(de))
-    print(f"  Renamed {uid} -> '{new_name}': {resp.status_code}")
+NEW_FIELDS = [
+    {"name": "Above Range Count (>180 mg/dL)", "shortName": "Above Range Count",
+     "valueType": "INTEGER", "aggregationType": "SUM"},
+    {"name": "Below Range Count (<70 mg/dL)", "shortName": "Below Range Count",
+     "valueType": "INTEGER", "aggregationType": "SUM"},
+]
 
 
-print("=== Renaming existing fields ===")
-rename_data_element(RZpt03lifR6, 'Device High Count', 'Device High Count')
-rename_data_element(hi1TAwCqN0f, 'Device Low Count', 'Device Low Count')
-rename_data_element(Zu4iFxtthSU, 'Above Range Timestamps (>180 mg/dL)', 'Above Range Timestamps')
-rename_data_element(LfzwHxQUotL, 'Below Range Timestamps (<70 mg/dL)', 'Below Range Timestamps')
+def rename(session, uid, name, short_name):
+    """PATCH just the two label fields, leaving everything else alone."""
+    dhis2.request(
+        session, "PATCH", f"{dhis2.api_url()}/dataElements/{uid}",
+        headers={"Content-Type": "application/json-patch+json"},
+        data=json.dumps([
+            {"op": "replace", "path": "/name", "value": name},
+            {"op": "replace", "path": "/shortName", "value": short_name[:50]},
+        ]),
+    )
+    print(f"  {uid} -> {name}")
 
-print("\n=== Creating 2 new count fields ===")
-de_payload = {
-    'dataElements': [
-        {
-            'name': 'Above Range Count (>180 mg/dL)',
-            'shortName': 'Above Range Count',
-            'domainType': 'TRACKER',
-            'valueType': 'INTEGER',
-            'aggregationType': 'SUM',
-        },
-        {
-            'name': 'Below Range Count (<70 mg/dL)',
-            'shortName': 'Below Range Count',
-            'domainType': 'TRACKER',
-            'valueType': 'INTEGER',
-            'aggregationType': 'SUM',
-        },
-    ]
-}
-resp = session.post(f'{DHIS2_URL}/api/metadata', headers=headers, data=json.dumps(de_payload))
-print("Data elements:", resp.status_code)
-print(resp.text[:400])
 
-lookup = session.get(
-    f'{DHIS2_URL}/api/dataElements',
-    params={'filter': 'name:in:[Above Range Count (>180 mg/dL),Below Range Count (<70 mg/dL)]',
-            'fields': 'id,name'}
-).json()
-de_map = {de['name']: de['id'] for de in lookup.get('dataElements', [])}
-print("New DE UIDs:", de_map)
+def main():
+    session = dhis2.get_session()
 
-ABOVE_COUNT_DE = de_map.get('Above Range Count (>180 mg/dL)')
-BELOW_COUNT_DE = de_map.get('Below Range Count (<70 mg/dL)')
+    print("Renaming existing fields")
+    for uid, name, short_name in RENAMES:
+        rename(session, uid, name, short_name)
 
-if not (ABOVE_COUNT_DE and BELOW_COUNT_DE):
-    print("STOP - could not find both new data elements")
-    exit(1)
+    print("\nCreating the clinical range count fields")
+    uids = dhis2.create_data_elements(session, NEW_FIELDS)
+    for name, uid in uids.items():
+        print(f"  {name}: {uid}")
 
-stage_full = session.get(f'{DHIS2_URL}/api/programStages/{GLUCOSE_STAGE_UID}', params={'fields': '*'}).json()
-existing_uids = {pde['dataElement']['id'] for pde in stage_full['programStageDataElements']}
-max_sort = max((pde['sortOrder'] for pde in stage_full['programStageDataElements']), default=0)
+    added = dhis2.attach_data_elements(
+        session, M.CGM_GLUCOSE_STAGE_UID, list(uids.values())
+    )
+    print(f"\nAttached {added} field(s) to the CGM glucose stage.")
+    print("glucose_recount_step2_backfill.py resolves these by name.")
 
-added = 0
-for uid in [ABOVE_COUNT_DE, BELOW_COUNT_DE]:
-    if uid not in existing_uids:
-        max_sort += 1
-        stage_full['programStageDataElements'].append({
-            'dataElement': {'id': uid}, 'compulsory': False, 'sortOrder': max_sort,
-        })
-        added += 1
 
-if added > 0:
-    resp2 = session.put(f'{DHIS2_URL}/api/programStages/{GLUCOSE_STAGE_UID}',
-                         headers=headers, data=json.dumps(stage_full))
-    print(f"Attached {added} fields: {resp2.status_code}")
-else:
-    print("Already attached")
-
-print(f"\n\n=== SAVE THESE ===\nABOVE_COUNT_DE = '{ABOVE_COUNT_DE}'\nBELOW_COUNT_DE = '{BELOW_COUNT_DE}'")
+if __name__ == "__main__":
+    main()

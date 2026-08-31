@@ -1,81 +1,55 @@
 #!/usr/bin/env python3
-"""
-diagnose_cohort_query.py
+"""Print raw tracker JSON for one participant, to inspect real field names.
 
-Diagnostic only — read-only, GET requests only, same safety guarantees
-as every other script. Prints the RAW event JSON for one participant's
-Retinal Photography events and CGM-Glucose events, so we can see the
-actual field names this DHIS2 build uses, instead of assuming they
-match standard documentation (the same class of issue found in
-Phase 20 — the "trackedEntities" vs "instances" key mismatch).
+Diagnostic only. READ-ONLY, GET requests only.
+
+WHAT THE AUDIT FOUND (C-01, H-13), and what changed
+----------------------------------------------------
+Credentials come from the environment, and metadata_uids is now committed in
+common/ so this script can actually run.
 
 USAGE
--------
-Run this, then paste the FULL printed output back — don't summarize
-it, the exact key names matter.
+-----
+    python3 "7. verification data script/diagnose_cohort_query.py"
 """
 
-import os
 import json
-import requests
+import os
+import sys
 
-import metadata_uids as M
-
-BASE_URL = "https://t2d-registry.plhi.us"
-
-AUDITOR_USER = os.environ["DHIS2_AUDITOR_USER"]
-AUDITOR_PASS = os.environ["DHIS2_AUDITOR_PASS"]
-
-SESSION = requests.Session()
-SESSION.auth = (AUDITOR_USER, AUDITOR_PASS)
-
-
-def get_one_participant():
-    r = SESSION.get(
-        f"{BASE_URL}/api/tracker/trackedEntities",
-        params={"program": M.PROGRAM_UID, "fields": "trackedEntity", "pageSize": 1},
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    print("Raw trackedEntities response (first participant lookup):")
-    print(json.dumps(data, indent=2)[:1000])
-    print()
-    return data["trackedEntities"][0]["trackedEntity"]
-
-
-def dump_events(person_uid, stage_uid, label):
-    r = SESSION.get(
-        f"{BASE_URL}/api/tracker/events",
-        params={
-            "program": M.PROGRAM_UID,
-            "programStage": stage_uid,
-            "trackedEntity": person_uid,
-        },
-        timeout=30,
-    )
-    print(f"--- {label} events for {person_uid} ---")
-    print(f"HTTP status: {r.status_code}")
-    r.raise_for_status()
-    data = r.json()
-    events = data.get("events", [])
-    print(f"Number of events returned: {len(events)}")
-    if events:
-        print("Full JSON of first event:")
-        print(json.dumps(events[0], indent=2))
-    else:
-        print("No events returned for this participant/stage at all.")
-    print()
-    return events
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
 
 
 def main():
-    person_uid = get_one_participant()
-    print(f"Using participant: {person_uid}\n")
+    session = dhis2.get_session(read_only=True)
+    registry = M.load(session)
 
-    dump_events(person_uid, M.RETINAL_PHOTOGRAPHY_STAGE_UID, "Retinal Photography")
-    dump_events(person_uid, M.CGM_GLUCOSE_STAGE_UID, "CGM-Glucose")
+    payload = dhis2.get_json(session, "tracker/trackedEntities", {
+        "program": M.PROGRAM_UID, "fields": "trackedEntity", "pageSize": 1,
+    })
+    print("Raw trackedEntities response:")
+    print(json.dumps(payload, indent=2)[:1000])
+
+    items = dhis2.extract_items(payload, "trackedEntities", "instances")
+    if not items:
+        print("\nNo participants returned.")
+        return 1
+    tei_uid = items[0]["trackedEntity"]
+    print(f"\nUsing participant: {tei_uid}\n")
+
+    for label, stage_name in (("Retinal Photography", "Retinal Photography"),
+                              ("CGM - Glucose", "CGM - Glucose")):
+        events = dhis2.fetch_events(
+            session, M.PROGRAM_UID, registry.stage(stage_name), tei_uid
+        )
+        print(f"--- {label}: {len(events)} events ---")
+        if events:
+            print(json.dumps(events[0], indent=2))
+        print()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

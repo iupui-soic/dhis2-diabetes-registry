@@ -26,8 +26,21 @@ CORRECTED per review:
 
 import csv
 import math
-from datetime import datetime
+import os
+import sys
+from datetime import datetime, timezone
 from collections import defaultdict
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common.numeric import safe_round  # noqa: E402
+from common.timeutil import time_only  # noqa: E402
+
+# The environment CSVs carry no timezone suffix, but they are UTC. Confirmed
+# by diurnal check: for UW participants the daily indoor temperature maximum
+# falls at 23:00-03:00 in the file's own labels, which is 16:00-20:00 local
+# Pacific, the expected afternoon peak. Treating them as local time would put
+# the peak in the middle of the night. Stamping UTC here means environment
+# events serialise with an explicit offset like every other modality. (M-20)
 
 RELEVANT_COLUMNS = ['pm1', 'pm2.5', 'pm4', 'pm10', 'hum', 'temp', 'voc', 'nox']
 
@@ -60,7 +73,8 @@ def read_env_csv(filepath):
             if not parts or len(parts) < len(header):
                 continue
             try:
-                ts = datetime.strptime(parts[0], '%Y-%m-%d %H:%M:%S')
+                ts = datetime.strptime(parts[0], '%Y-%m-%d %H:%M:%S').replace(
+                    tzinfo=timezone.utc)
             except (ValueError, IndexError):
                 continue
 
@@ -81,8 +95,24 @@ def parse_hour_bucket(dt):
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
-def time_only(dt):
-    return dt.strftime('%H:%M:%S')
+MAX_FLAGGED_TIMESTAMPS = 20
+
+
+def summarise_timestamps(flagged):
+    """Comma-separated flagged times, truncated so one value cannot balloon.
+
+    M-19: the sensor samples roughly every five seconds, so an hour entirely
+    outside the comfort range produced about 720 timestamps, near 6.5 KB, in
+    a single LONG_TEXT value. The paired count field already carries the
+    magnitude, so the list is capped and says how many it omitted.
+    """
+    if not flagged:
+        return None
+    times = [time_only(ts) for ts, _ in sorted(flagged)]
+    if len(times) <= MAX_FLAGGED_TIMESTAMPS:
+        return ', '.join(times)
+    shown = ', '.join(times[:MAX_FLAGGED_TIMESTAMPS])
+    return f"{shown}, ... and {len(times) - MAX_FLAGGED_TIMESTAMPS} more"
 
 
 def aggregate_env_column(rows, column):
@@ -104,12 +134,12 @@ def aggregate_env_column(rows, column):
 
         if len(values) > 1:
             variance = sum((v - mean) ** 2 for v in values) / len(values)
-            sd = round(variance ** 0.5, 3)
+            sd = safe_round(variance ** 0.5, 3)
         else:
             sd = None
 
         entry = {
-            'mean': round(mean, 3),
+            'mean': safe_round(mean, 3),
             'min': min(values),
             'max': max(values),
             'sd': sd,
@@ -119,12 +149,12 @@ def aggregate_env_column(rows, column):
         if 'above' in thresholds:
             above = [(ts, v) for ts, v in readings if v > thresholds['above']]
             entry['above_count'] = len(above)
-            entry['above_ts'] = ', '.join(time_only(ts) for ts, v in sorted(above)) or None
+            entry['above_ts'] = summarise_timestamps(above)
 
         if 'below' in thresholds:
             below = [(ts, v) for ts, v in readings if v < thresholds['below']]
             entry['below_count'] = len(below)
-            entry['below_ts'] = ', '.join(time_only(ts) for ts, v in sorted(below)) or None
+            entry['below_ts'] = summarise_timestamps(below)
 
         result[hour] = entry
 
