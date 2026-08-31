@@ -1,233 +1,214 @@
-"""
-Final full-scale HOURLY AGGREGATED import, using:
-  - shared Mean/Min/Max/Count fields for Heart Rate, Respiratory Rate,
-    SpO2, Stress
-  - dedicated fields for Sleep (duration-minutes), Activity (steps sum,
-    now duration-split correctly), and Glucose (rich clinical metrics)
+#!/usr/bin/env python3
+"""Hourly aggregated import of the wearable and CGM modalities.
 
-Run in the background:
-    nohup python3 hourly_step2_final.py > hourly_import_log.txt 2>&1 &
-    tail -f hourly_import_log.txt
+WHAT THE AUDIT FOUND (C-01, H-05, H-06, H-09), and what changed
+---------------------------------------------------------------
+1. Credentials were a REPLACE_ME constant, and the stage UIDs were a block
+   pasted in by hand after running step 1. Both now resolve automatically:
+   credentials from the environment, UIDs from common.metadata_uids.
+
+2. send_batch returned nothing and only printed on failure, and the caller
+   then checkpointed the participant unconditionally. A participant whose
+   entire batch was rejected was recorded as done and skipped forever after.
+   Writes now raise on rejection and the checkpoint records the failure.
+
+3. The per-stage try/except caught every exception and moved on, so a
+   systematic bug looked identical to a missing file. Failures are now
+   attributed to the participant and re-tried on the next run.
+
+USAGE
+-----
+    nohup python3 "2. wearable script/hourly_step2_final.py" > hourly_import.log 2>&1 &
+    tail -f hourly_import.log
 """
 
-import json
-import csv
-import time
+import argparse
 import os
-import requests
-from hourly_aggregation_logic_final import (
-    aggregate_simple, aggregate_glucose, aggregate_activity,
-    extract_heart_rate, extract_respiratory_rate, extract_oxygen_saturation,
-    extract_stress, extract_sleep_segments,
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
+from common.checkpoint import Checkpoint  # noqa: E402
+
+from hourly_aggregation_logic_final import (  # noqa: E402
+    aggregate_activity, aggregate_calories, aggregate_glucose, aggregate_simple,
+    extract_heart_rate, extract_oxygen_saturation, extract_respiratory_rate,
+    extract_sleep_segments, extract_stress,
 )
 
-# ---- CONFIG - fill in from hourly_step1_final.py's printed output ----
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
-PERSON_ID_ATTR_UID = 'oFbmOHnKYaX'
-AI_READI_ROOT = '/home/jupyter-ainaperu/AI-READI-fixed'
-BATCH_SIZE = 500
-CHECKPOINT_FILE = 'hourly_checkpoint_final.json'
+CHECKPOINT_FILE = "hourly_checkpoint_final.json"
+BATCH_SIZE = 200
 
-# Paste the full dict printed by hourly_step1_final.py here:
-STAGE_UIDS = {
-    'Wearable – Heart Rate': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Wearable – Respiratory Rate': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Wearable – SpO2': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Wearable – Stress': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Wearable – Sleep': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Wearable – Activity': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Wearable – Calories': {'stage': 'REPLACE_ME', 'fields': {}},
-    'CGM – Glucose': {'stage': 'REPLACE_ME', 'fields': {}},
-}
-
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
+CONTINUOUS = [
+    ("Wearable - Heart Rate", "heartrate_filepath", extract_heart_rate),
+    ("Wearable - Respiratory Rate", "respiratory_rate_filepath", extract_respiratory_rate),
+    ("Wearable - SpO2", "oxygen_saturation_filepath", extract_oxygen_saturation),
+    ("Wearable - Stress", "stress_level_filepath", extract_stress),
+]
 
 
-def load_manifest(path):
-    with open(path) as f:
-        return {row['person_id']: row for row in csv.DictReader(f, delimiter='\t')}
+def stage_config(registry):
+    """Resolve every stage UID and its field UIDs once, up front."""
+    shared = registry.wearable_shared_uids()
+    config = {}
+    for name, _, _ in CONTINUOUS:
+        config[name] = {"stage": registry.stage(name), "fields": dict(shared)}
+    config["Wearable - Sleep"] = {
+        "stage": registry.stage("Wearable - Sleep"),
+        "fields": {
+            "stage": registry.data_element("Sleep Stage"),
+            "duration_minutes": registry.data_element("Sleep Segment Duration Minutes"),
+        },
+    }
+    config["Wearable - Activity"] = {
+        "stage": registry.stage("Wearable - Activity"),
+        "fields": {
+            "sum": registry.data_element("Steps Sum"),
+            "count": registry.data_element("Steps Reading Count"),
+        },
+    }
+    config["Wearable - Calories"] = {
+        "stage": registry.stage("Wearable - Calories"),
+        "fields": {
+            "sum": registry.data_element("Calories Sum"),
+            "count": registry.data_element("Calories Reading Count"),
+        },
+    }
+    config["CGM - Glucose"] = {
+        "stage": registry.stage("CGM - Glucose"),
+        "fields": dict(M.GLUCOSE_FIELD_UIDS),
+    }
+    return config
 
 
-def get_tei_info(person_id):
-    resp = session.get(
-        f'{DHIS2_URL}/api/tracker/trackedEntities',
-        params={'program': PROGRAM_UID, 'filter': f'{PERSON_ID_ATTR_UID}:eq:{person_id}',
-                'fields': 'trackedEntity,orgUnit,enrollments[enrollment]'},
-    )
-    resp.raise_for_status()
-    instances = resp.json().get('trackedEntities', [])
-    if not instances:
-        return None
-    tei = instances[0]
-    enrollment = tei['enrollments'][0]['enrollment'] if tei.get('enrollments') else None
-    return {'trackedEntity': tei['trackedEntity'], 'orgUnit': tei['orgUnit'], 'enrollment': enrollment}
-
-
-def make_event(stage_name, tei_info, hour, field_values):
-    cfg = STAGE_UIDS[stage_name]
+def make_event(config, stage_name, context, occurred_at, values):
+    cfg = config[stage_name]
     data_values = []
-    for field_name, value in field_values.items():
-        if value is None:
-            continue
-        de_uid = cfg['fields'].get(field_name)
-        if de_uid:
-            data_values.append({'dataElement': de_uid, 'value': str(value)})
+    for key, value in values.items():
+        entry = dhis2.data_value(cfg["fields"].get(key), value)
+        if entry:
+            data_values.append(entry)
+    if not data_values:
+        return None
     return {
-        'program': PROGRAM_UID, 'programStage': cfg['stage'],
-        'trackedEntity': tei_info['trackedEntity'], 'enrollment': tei_info['enrollment'],
-        'orgUnit': tei_info['orgUnit'], 'occurredAt': hour, 'status': 'COMPLETED',
-        'dataValues': data_values,
+        "program": M.PROGRAM_UID,
+        "programStage": cfg["stage"],
+        "trackedEntity": context["trackedEntity"],
+        "enrollment": context["enrollment"],
+        "orgUnit": context["orgUnit"],
+        "occurredAt": occurred_at,
+        "status": "COMPLETED",
+        "dataValues": data_values,
     }
 
 
-def build_events_for_participant(person_id, tei_info, wam_row, bg_row):
+def build_events(config, context, wam_row, bg_row):
+    """Build every event for one participant.
+
+    Raises on a genuine failure rather than swallowing it, so the caller can
+    record the participant as failed instead of complete.
+    """
     events = []
 
-    # 4 shared-field continuous metrics
-    continuous = [
-        ('Wearable – Heart Rate', 'heartrate_filepath', extract_heart_rate),
-        ('Wearable – Respiratory Rate', 'respiratory_rate_filepath', extract_respiratory_rate),
-        ('Wearable – SpO2', 'oxygen_saturation_filepath', extract_oxygen_saturation),
-        ('Wearable – Stress', 'stress_level_filepath', extract_stress),
-    ]
-    for stage_name, col, extractor in continuous:
-        fp_suffix = wam_row.get(col)
-        if not fp_suffix:
+    for stage_name, column, extractor in CONTINUOUS:
+        path = aireadi.resolve("wearable_activity_monitor", wam_row.get(column))
+        if not path:
             continue
-        full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-        try:
-            hourly = aggregate_simple(extractor(full_path))
-        except Exception as e:
-            print(f"  {person_id}/{stage_name}: error - {e}")
-            continue
-        for hour, stats in hourly.items():
-            events.append(make_event(stage_name, tei_info, hour, stats))
+        for hour, stats in aggregate_simple(extractor(path)).items():
+            event = make_event(config, stage_name, context, hour, stats)
+            if event:
+                events.append(event)
 
-    # Sleep - RAW SEGMENTS, one event per stage transition (not hourly)
-    fp_suffix = wam_row.get('sleep_filepath')
-    if fp_suffix:
-        full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-        try:
-            for start_ts, stage, duration_min in extract_sleep_segments(full_path):
-                events.append(make_event('Wearable – Sleep', tei_info, start_ts,
-                                          {'stage': stage, 'duration_minutes': duration_min}))
-        except Exception as e:
-            print(f"  {person_id}/Sleep: error - {e}")
+    path = aireadi.resolve("wearable_activity_monitor", wam_row.get("sleep_filepath"))
+    if path:
+        for start_ts, sleep_stage, duration in extract_sleep_segments(path):
+            event = make_event(config, "Wearable - Sleep", context, start_ts,
+                               {"stage": sleep_stage, "duration_minutes": duration})
+            if event:
+                events.append(event)
 
-    # Activity (now duration-split correctly)
-    fp_suffix = wam_row.get('physical_activity_filepath')
-    if fp_suffix:
-        full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-        try:
-            hourly = aggregate_activity(full_path)
-            for hour, stats in hourly.items():
-                events.append(make_event('Wearable – Activity', tei_info, hour, stats))
-        except Exception as e:
-            print(f"  {person_id}/Activity: error - {e}")
+    path = aireadi.resolve("wearable_activity_monitor", wam_row.get("physical_activity_filepath"))
+    if path:
+        for hour, stats in aggregate_activity(path).items():
+            event = make_event(config, "Wearable - Activity", context, hour, stats)
+            if event:
+                events.append(event)
 
-    # Calories (unchanged - point-in-time readings, no splitting needed)
-    fp_suffix = wam_row.get('active_calories_filepath')
-    if fp_suffix:
-        full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-        try:
-            with open(full_path) as f:
-                data = json.load(f)
-            from collections import defaultdict
-            hourly_sum, hourly_count = defaultdict(float), defaultdict(int)
-            for r in data['body']['activity']:
-                if r.get('activity_name') == 'kcal_burned':
-                    ts = r['effective_time_frame'].get('date_time') or r['effective_time_frame']['time_interval']['start_date_time']
-                    from datetime import datetime
-                    hour = datetime.fromisoformat(ts.replace('Z', '+00:00')).replace(minute=0, second=0, microsecond=0).isoformat()
-                    hourly_sum[hour] += r['calories_value']['value']
-                    hourly_count[hour] += 1
-            for hour in hourly_sum:
-                events.append(make_event('Wearable – Calories', tei_info, hour,
-                                          {'sum': round(hourly_sum[hour], 1), 'count': hourly_count[hour]}))
-        except Exception as e:
-            print(f"  {person_id}/Calories: error - {e}")
+    path = aireadi.resolve("wearable_activity_monitor", wam_row.get("active_calories_filepath"))
+    if path:
+        for hour, stats in aggregate_calories(path).items():
+            event = make_event(config, "Wearable - Calories", context, hour, stats)
+            if event:
+                events.append(event)
 
-    # Glucose
-    fp_suffix = bg_row.get('glucose_filepath')
-    if fp_suffix:
-        full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-        try:
-            hourly = aggregate_glucose(full_path)
-            for hour, stats in hourly.items():
-                events.append(make_event('CGM – Glucose', tei_info, hour, stats))
-        except Exception as e:
-            print(f"  {person_id}/Glucose: error - {e}")
+    path = aireadi.resolve("wearable_blood_glucose", bg_row.get("glucose_filepath"))
+    if path:
+        for hour, stats in aggregate_glucose(path).items():
+            event = make_event(config, "CGM - Glucose", context, hour, stats)
+            if event:
+                events.append(event)
 
     return events
 
 
-def send_batch(events):
-    for i in range(0, len(events), BATCH_SIZE):
-        batch = events[i:i + BATCH_SIZE]
-        resp = session.post(f'{DHIS2_URL}/api/tracker',
-                             params={'async': 'false', 'importStrategy': 'CREATE'},
-                             json={'events': batch})
-        try:
-            status = resp.json().get('status', 'UNKNOWN')
-        except Exception:
-            status = f"HTTP {resp.status_code}"
-        if status not in ('OK', 'SUCCESS'):
-            print(f"    batch error: {resp.text[:500]}")
-
-
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
-    return {'completed': []}
-
-
-def save_checkpoint(cp):
-    with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(cp, f)
-
-
 def main():
-    wam_manifest = load_manifest(f'{AI_READI_ROOT}/wearable_activity_monitor/manifest.tsv')
-    bg_manifest = load_manifest(f'{AI_READI_ROOT}/wearable_blood_glucose/manifest.tsv')
-    all_person_ids = sorted(set(wam_manifest.keys()) | set(bg_manifest.keys()))
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--limit", type=int, help="process at most this many participants")
+    parser.add_argument("--person-id", help="process a single participant")
+    args, _ = parser.parse_known_args()
 
-    checkpoint = load_checkpoint()
-    completed = set(checkpoint['completed'])
-    remaining = [pid for pid in all_person_ids if pid not in completed]
-    print(f"Total: {len(all_person_ids)}, done: {len(completed)}, remaining: {len(remaining)}")
+    session = dhis2.get_session()
+    registry = M.load(session)
+    config = stage_config(registry)
 
-    overall_start = time.time()
-    for idx, person_id in enumerate(remaining):
-        t0 = time.time()
-        tei_info = get_tei_info(person_id)
-        if tei_info is None:
-            print(f"[{idx+1}/{len(remaining)}] {person_id}: no TEI, skipping")
-            completed.add(person_id)
-            checkpoint['completed'] = list(completed)
-            save_checkpoint(checkpoint)
-            continue
+    wam = aireadi.load_manifest_first("wearable_activity_monitor")
+    bg = aireadi.load_manifest_first("wearable_blood_glucose")
+    all_ids = sorted(set(wam) | set(bg))
 
-        wam_row = wam_manifest.get(person_id, {})
-        bg_row = bg_manifest.get(person_id, {})
-        events = build_events_for_participant(person_id, tei_info, wam_row, bg_row)
-        send_batch(events)
+    with Checkpoint(CHECKPOINT_FILE, flush_every=5) as checkpoint:
+        if args.person_id:
+            remaining = [args.person_id]
+        else:
+            remaining = checkpoint.pending(all_ids)
+            if args.limit:
+                remaining = remaining[:args.limit]
 
-        elapsed = time.time() - t0
-        completed.add(person_id)
-        checkpoint['completed'] = list(completed)
-        save_checkpoint(checkpoint)
+        print(f"Total {len(all_ids)}, {checkpoint.summary()}, {len(remaining)} to process")
+        start = time.time()
 
-        total_elapsed = time.time() - overall_start
-        print(f"[{idx+1}/{len(remaining)}] {person_id}: {len(events)} events, "
-              f"{elapsed:.1f}s (total: {total_elapsed/3600:.2f}h)")
+        for index, person_id in enumerate(remaining, start=1):
+            t0 = time.time()
+            try:
+                context = dhis2.get_tei_context(
+                    session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
+                )
+                if context is None:
+                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    print(f"[{index}/{len(remaining)}] {person_id}: no TEI, skipped")
+                    continue
 
-    print("\nALL PARTICIPANTS COMPLETE")
+                events = build_events(
+                    config, context, wam.get(person_id, {}), bg.get(person_id, {})
+                )
+                if events:
+                    dhis2.send_events(session, events, "CREATE", batch_size=BATCH_SIZE)
+                checkpoint.mark_done(person_id)
+                print(f"[{index}/{len(remaining)}] {person_id}: {len(events)} events, "
+                      f"{time.time() - t0:.1f}s (total {(time.time() - start) / 3600:.2f}h)")
+
+            except Exception as exc:
+                checkpoint.mark_failed(person_id, exc)
+                print(f"[{index}/{len(remaining)}] {person_id}: FAILED, {str(exc)[:300]}")
+
+    print(f"\nRun complete. {checkpoint.summary()}")
+    if checkpoint.failed:
+        print(f"{len(checkpoint.failed)} participant(s) failed and will be retried "
+              f"on the next run. See {CHECKPOINT_FILE}.")
+        return 1
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

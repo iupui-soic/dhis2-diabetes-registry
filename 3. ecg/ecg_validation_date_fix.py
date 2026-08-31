@@ -1,149 +1,91 @@
-"""
-Fixes the ECG Validation Date field, which was stored as raw '20241014'
-instead of a proper '2024-10-14' date format. Converts every existing
-event in place. Does not touch any other field.
+#!/usr/bin/env python3
+"""Repair ECG Validation Date values stored as 20241014 instead of 2024-10-14.
 
-Run:
-    python3 ecg_validation_date_fix.py
-(small dataset, ~2257 events - runs in well under a minute in the foreground)
+Converts every affected event in place and touches no other field.
+
+Only needed for events imported before ecg_step2_import.py started
+normalising the date. New imports do not need this script.
+
+WHAT THE AUDIT FOUND (C-01, H-05, H-06), and what changed
+----------------------------------------------------------
+The paging loop called resp.json().get("events", []) with no status check, so
+any HTTP error produced an empty list and the script printed "Total events
+fetched: 0", "Events needing fix: 0" and "DONE" having done nothing. It now
+raises. Credentials come from the environment, and updates carry the event's
+full data value set because a tracker UPDATE replaces them.
+
+USAGE
+-----
+    python3 "3. ecg/ecg_validation_date_fix.py" --dry-run
+    python3 "3. ecg/ecg_validation_date_fix.py"
 """
 
-import requests
+import argparse
+import os
+import sys
 from datetime import datetime
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
 
-# From ecg_step1_metadata.py's original output:
-STAGE_UID = 'xQjp0SgUbzv'
-VALIDATION_DATE_DE = 'wweIn1KripN'
-
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
+from ecg_step1_metadata import STAGE_NAME  # noqa: E402
 
 
-def format_validation_date(raw):
-    """Converts '20241014' -> '2024-10-14'. Returns raw value unchanged
-    if it doesn't match the expected 8-digit format."""
+def reformat(raw):
+    """20241014 -> 2024-10-14. Returns None when it is not that shape."""
     if raw and len(raw) == 8 and raw.isdigit():
         try:
-            return datetime.strptime(raw, '%Y%m%d').strftime('%Y-%m-%d')
+            return datetime.strptime(raw, "%Y%m%d").strftime("%Y-%m-%d")
         except ValueError:
-            return raw
-    return raw
-
-
-def fetch_all_events():
-    all_events = []
-    page = 1
-    while True:
-        resp = session.get(
-            f'{DHIS2_URL}/api/tracker/events',
-            params={
-                'program': PROGRAM_UID, 'programStage': STAGE_UID,
-                'pageSize': 500, 'page': page,
-                'fields': 'event,orgUnit,enrollment,trackedEntity,occurredAt,status,dataValues',
-            },
-        )
-        events = resp.json().get('events', [])
-        if not events:
-            break
-        all_events.extend(events)
-        page += 1
-    return all_events
-
-
-def build_update(event):
-    """Returns an update payload if the date needs fixing, else None."""
-    data_values = list(event['dataValues'])
-    changed = False
-
-    for dv in data_values:
-        if dv['dataElement'] == VALIDATION_DATE_DE:
-            old_val = dv['value']
-            new_val = format_validation_date(old_val)
-            if new_val != old_val:
-                dv['value'] = new_val
-                changed = True
-
-    if not changed:
-        return None
-
-    return {
-        'event': event['event'],
-        'program': PROGRAM_UID,
-        'programStage': STAGE_UID,
-        'orgUnit': event['orgUnit'],
-        'enrollment': event.get('enrollment'),
-        'trackedEntity': event.get('trackedEntity'),
-        'occurredAt': event['occurredAt'],
-        'status': event.get('status', 'COMPLETED'),
-        'dataValues': data_values,
-    }
-
-
-def send_batch(events, batch_size=50):
-    import time
-    for i in range(0, len(events), batch_size):
-        batch = events[i:i + batch_size]
-        resp = session.post(
-            f'{DHIS2_URL}/api/tracker',
-            params={'importStrategy': 'UPDATE', 'async': 'false'},
-            json={'events': batch},
-        )
-        try:
-            status = resp.json().get('status', 'UNKNOWN')
-        except Exception:
-            status = f"HTTP {resp.status_code}"
-        if status not in ('OK', 'SUCCESS'):
-            print(f"    batch error (items {i}-{i+len(batch)}): {resp.text[:300]}")
-        else:
-            print(f"    batch {i}-{i+len(batch)}: OK")
-        time.sleep(1.5)
+            return None
+    return None
 
 
 def main():
-    print("Fetching all ECG events...")
-    events = fetch_all_events()
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--dry-run", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    session = dhis2.get_session()
+    registry = M.load(session)
+    stage_uid = registry.stage(STAGE_NAME)
+    date_de = registry.data_element("ECG Validation Date")
+
+    print("Fetching ECG events...")
+    events = dhis2.fetch_events(session, M.PROGRAM_UID, stage_uid)
     print(f"Total events fetched: {len(events)}")
 
     updates = []
-    already_correct = 0
-    for e in events:
-        u = build_update(e)
-        if u:
-            updates.append(u)
-        else:
-            already_correct += 1
-
-    print(f"Events needing fix: {len(updates)}")
-    print(f"Already correct (or missing this field): {already_correct}")
-
-    if updates:
-        send_batch(updates)
-        print(f"Sent {len(updates)} updates")
-
-    # Quick verification on a few
-    print("\nSample check after update:")
-    try:
-        resp = session.get(
-            f'{DHIS2_URL}/api/tracker/events',
-            params={'program': PROGRAM_UID, 'programStage': STAGE_UID,
-                     'pageSize': 5, 'fields': 'event,dataValues'}
+    already_ok = 0
+    for event in events:
+        current = next(
+            (dv.get("value") for dv in event.get("dataValues", [])
+             if dv["dataElement"] == date_de),
+            None,
         )
-        data = resp.json()
-        for e in data.get('events', []):
-            for dv in e['dataValues']:
-                if dv['dataElement'] == VALIDATION_DATE_DE:
-                    print(f"  {e['event']}: {dv['value']}")
-    except Exception as e:
-        print(f"  Verification call failed ({e}) - this doesn't affect whether the updates succeeded. "
-              f"Re-run the 'still needs fixing' check separately to confirm.")
+        fixed = reformat(current)
+        if fixed is None or fixed == current:
+            already_ok += 1
+            continue
+        updates.append(dhis2.event_update_payload(
+            event, stage_uid, M.PROGRAM_UID,
+            dhis2.merge_data_values(event, {date_de: fixed}),
+        ))
 
-    print("\nDONE")
+    print(f"Events needing a fix: {len(updates)}")
+    print(f"Already correct, or missing the field: {already_ok}")
+
+    if not updates:
+        return 0
+    if args.dry_run:
+        print("Dry run, nothing written.")
+        return 0
+
+    stats = dhis2.send_events(session, updates, "UPDATE", batch_size=50)
+    print(f"Updated {stats['updated']} event(s).")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

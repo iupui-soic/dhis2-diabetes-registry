@@ -1,155 +1,180 @@
+#!/usr/bin/env python3
+"""Import one event per diagnosed condition from condition_occurrence.csv.
+
+condition_source_value has the form "code, Label text" and is split on the
+first comma. Verified across the dataset: all 12,375 values contain a comma.
+
+WHAT THE AUDIT FOUND (C-01, H-05, H-08), and what changed
+----------------------------------------------------------
+H-08: parse_condition_value returned its argument unchanged when it was not a
+string, so a missing condition_source_value came back as a float NaN for both
+code and label. The data value was then built as {'value': code} with no
+str(), and json.dumps writes a bare NaN token, which is not valid JSON, so
+DHIS2 would reject the whole 100-event batch. The same applied to
+occurredAt: str(date), which became the string "nan".
+
+That path is unreachable on the current export, which has zero nulls in
+either column, but it is one upstream change away from rejecting entire
+batches. Rows missing a code or a date are now skipped and counted, and every
+value goes through the shared null and NaN guard.
+
+H-05: the participant was checkpointed complete regardless of the outcome.
+
+USAGE
+-----
+    python3 "5. diagnosis/diagnosis_step2_import.py"
 """
-Imports one event per diagnosed condition per participant into the
-"Diagnosis History" stage, from clinical_data/condition_occurrence.csv.
 
-condition_source_value format: "code, Label text" - split on the first comma.
-
-Run:
-    python3 diagnosis_step2_import.py
-(small-to-medium dataset, ~12,375 events total)
-"""
-
-import json
+import argparse
 import os
+import sys
 import time
-import requests
+from datetime import datetime
+
 import pandas as pd
-from pathlib import Path
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
-PERSON_ID_ATTR_UID = 'oFbmOHnKYaX'
-AI_READI_ROOT = Path(os.path.expanduser('~/AI-READI'))
-CHECKPOINT_FILE = 'diagnosis_checkpoint.json'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
+from common.checkpoint import Checkpoint  # noqa: E402
+
+from diagnosis_step1_metadata import STAGE_NAME  # noqa: E402
+
+CHECKPOINT_FILE = "diagnosis_checkpoint.json"
 BATCH_SIZE = 100
-
-# From diagnosis_step1_metadata.py's printed output:
-STAGE_UID = 'REPLACE_ME'
-FIELD_UIDS = {
-    'Diagnosis Condition Code': 'REPLACE_ME',
-    'Diagnosis Condition Label': 'REPLACE_ME',
-    'Diagnosis Date': 'REPLACE_ME',
-}
-
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
-
-
-def get_tei_info(person_id):
-    resp = session.get(
-        f'{DHIS2_URL}/api/tracker/trackedEntities',
-        params={'program': PROGRAM_UID, 'filter': f'{PERSON_ID_ATTR_UID}:eq:{person_id}',
-                'fields': 'trackedEntity,orgUnit,enrollments[enrollment]'},
-    )
-    resp.raise_for_status()
-    instances = resp.json().get('trackedEntities', [])
-    if not instances:
-        return None
-    tei = instances[0]
-    enrollment = tei['enrollments'][0]['enrollment'] if tei.get('enrollments') else None
-    return {'trackedEntity': tei['trackedEntity'], 'orgUnit': tei['orgUnit'], 'enrollment': enrollment}
 
 
 def parse_condition_value(raw):
-    """'mhoccur_ad, Dementia (Examples...' -> ('mhoccur_ad', 'Dementia (Examples...')"""
-    if not isinstance(raw, str) or ',' not in raw:
-        return raw, raw
-    code, _, label = raw.partition(',')
+    """'mhoccur_ad, Dementia' -> ('mhoccur_ad', 'Dementia').
+
+    Returns (None, None) for anything that is not usable text, so a NaN can
+    never reach the payload.
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None, None
+    text = str(raw).strip()
+    if not text or text.lower() == "nan":
+        return None, None
+    if "," not in text:
+        return text, ""
+    code, _, label = text.partition(",")
     return code.strip(), label.strip()
 
 
-def build_events_for_participant(person_id, tei_info, rows):
-    events = []
-    for _, row in rows.iterrows():
-        code, label = parse_condition_value(row['condition_source_value'])
-        date = row['condition_start_date']
+def parse_date(raw):
+    """Normalise a condition_start_date. None when unusable."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in ("nan", "nat"):
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
-        data_values = [
-            {'dataElement': FIELD_UIDS['Diagnosis Condition Code'], 'value': code},
-            {'dataElement': FIELD_UIDS['Diagnosis Condition Label'], 'value': label},
-            {'dataElement': FIELD_UIDS['Diagnosis Date'], 'value': str(date)},
-        ]
+
+def build_events(field_uids, stage_uid, context, rows):
+    events, skipped = [], {}
+    for row in rows.itertuples(index=False):
+        code, label = parse_condition_value(getattr(row, "condition_source_value", None))
+        date = parse_date(getattr(row, "condition_start_date", None))
+
+        if code is None:
+            skipped["no condition code"] = skipped.get("no condition code", 0) + 1
+            continue
+        if date is None:
+            skipped["no usable start date"] = skipped.get("no usable start date", 0) + 1
+            continue
+
+        data_values = []
+        for uid, value in (
+            (field_uids["code"], code),
+            (field_uids["label"], label),
+            (field_uids["date"], date),
+        ):
+            entry = dhis2.data_value(uid, value)
+            if entry:
+                data_values.append(entry)
 
         events.append({
-            'program': PROGRAM_UID,
-            'programStage': STAGE_UID,
-            'trackedEntity': tei_info['trackedEntity'],
-            'enrollment': tei_info['enrollment'],
-            'orgUnit': tei_info['orgUnit'],
-            'occurredAt': str(date),
-            'status': 'COMPLETED',
-            'dataValues': data_values,
+            "program": M.PROGRAM_UID,
+            "programStage": stage_uid,
+            "trackedEntity": context["trackedEntity"],
+            "enrollment": context["enrollment"],
+            "orgUnit": context["orgUnit"],
+            "occurredAt": date,
+            "status": "COMPLETED",
+            "dataValues": data_values,
         })
-    return events
-
-
-def send_batch(events):
-    for i in range(0, len(events), BATCH_SIZE):
-        batch = events[i:i + BATCH_SIZE]
-        resp = session.post(
-            f'{DHIS2_URL}/api/tracker',
-            params={'importStrategy': 'CREATE', 'async': 'false'},
-            json={'events': batch},
-        )
-        try:
-            status = resp.json().get('status', 'UNKNOWN')
-        except Exception:
-            status = f"HTTP {resp.status_code}"
-        if status not in ('OK', 'SUCCESS'):
-            print(f"    batch error: {resp.text[:500]}")
-
-
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
-    return {'completed': []}
-
-
-def save_checkpoint(cp):
-    with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(cp, f)
+    return events, skipped
 
 
 def main():
-    cond = pd.read_csv(AI_READI_ROOT / "clinical_data" / "clinical_data" / "condition_occurrence.csv")
-    cond['person_id'] = cond['person_id'].astype(str)
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--person-id")
+    args, _ = parser.parse_known_args()
 
-    checkpoint = load_checkpoint()
-    completed = set(checkpoint['completed'])
+    session = dhis2.get_session()
+    registry = M.load(session)
+    stage_uid = registry.stage(STAGE_NAME)
+    field_uids = {
+        "code": registry.data_element("Diagnosis Condition Code"),
+        "label": registry.data_element("Diagnosis Condition Label"),
+        "date": registry.data_element("Diagnosis Date"),
+    }
 
-    all_person_ids = cond['person_id'].unique().tolist()
-    remaining = [pid for pid in all_person_ids if pid not in completed]
-    print(f"Total: {len(all_person_ids)}, done: {len(completed)}, remaining: {len(remaining)}")
+    conditions = pd.read_csv(aireadi.clinical_file("condition_occurrence.csv"))
+    conditions["person_id"] = conditions["person_id"].astype(str)
+    by_person = dict(tuple(conditions.groupby("person_id")))
+    all_ids = sorted(by_person)
 
-    start = time.time()
-    for idx, person_id in enumerate(remaining):
-        tei_info = get_tei_info(person_id)
-        if tei_info is None:
-            print(f"[{idx+1}/{len(remaining)}] {person_id}: no TEI, skipping "
-                  f"(this OMOP person_id may not match the registry's person_id scheme - verify)")
-            completed.add(person_id)
-            checkpoint['completed'] = list(completed)
-            save_checkpoint(checkpoint)
-            continue
+    with Checkpoint(CHECKPOINT_FILE, flush_every=20) as checkpoint:
+        remaining = [args.person_id] if args.person_id else checkpoint.pending(all_ids)
+        if args.limit:
+            remaining = remaining[:args.limit]
+        print(f"Total {len(all_ids)}, {checkpoint.summary()}, {len(remaining)} to process")
+        start = time.time()
+        skipped_total = {}
 
-        rows = cond[cond['person_id'] == person_id]
-        events = build_events_for_participant(person_id, tei_info, rows)
-        if events:
-            send_batch(events)
+        for index, person_id in enumerate(remaining, start=1):
+            try:
+                context = dhis2.get_tei_context(
+                    session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
+                )
+                if context is None:
+                    checkpoint.mark_done(
+                        person_id,
+                        note="no tracked entity; this OMOP person_id may not match "
+                             "the registry person_id scheme",
+                    )
+                    continue
 
-        completed.add(person_id)
-        checkpoint['completed'] = list(completed)
-        save_checkpoint(checkpoint)
+                events, skipped = build_events(
+                    field_uids, stage_uid, context, by_person[person_id]
+                )
+                for reason, count in skipped.items():
+                    skipped_total[reason] = skipped_total.get(reason, 0) + count
 
-        if (idx + 1) % 100 == 0:
-            elapsed = time.time() - start
-            print(f"[{idx+1}/{len(remaining)}] processed, {elapsed:.0f}s elapsed")
+                if events:
+                    dhis2.send_events(session, events, "CREATE", batch_size=BATCH_SIZE)
+                checkpoint.mark_done(person_id)
 
-    print("\nALL PARTICIPANTS COMPLETE")
+            except Exception as exc:
+                checkpoint.mark_failed(person_id, exc)
+                print(f"[{index}/{len(remaining)}] {person_id}: FAILED, {str(exc)[:300]}")
+
+            if index % 100 == 0:
+                print(f"[{index}/{len(remaining)}] {time.time() - start:.0f}s elapsed")
+
+    print(f"\nRun complete. {checkpoint.summary()}")
+    for reason, count in skipped_total.items():
+        print(f"  skipped {count} row(s): {reason}")
+    return 1 if checkpoint.failed else 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

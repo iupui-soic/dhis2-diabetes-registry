@@ -1,190 +1,161 @@
-"""
-Full-scale environment sensor import across all participants, using the
-hourly aggregation approach already validated for wearable/CGM data.
+#!/usr/bin/env python3
+"""Import hourly environment sensor summaries for every participant.
 
-Run in the background:
-    nohup python3 env_step2_import.py > env_import_log.txt 2>&1 &
-    tail -f env_import_log.txt
-    cat env_checkpoint.json
+WHAT THE AUDIT FOUND (C-01, H-05, H-06, M-20), and what changed
+----------------------------------------------------------------
+1. C-01: credentials and the dataset root come from the environment, and the
+   stage UIDs resolve by name instead of being pasted in from step 1.
+
+2. H-05: send_batch returned nothing and the participant was checkpointed
+   complete regardless of whether the import succeeded.
+
+3. M-20: occurredAt was a naive isoformat while every other modality sent an
+   explicit +00:00. The underlying data agrees, since the environment CSVs
+   are UTC despite carrying no suffix, but a naive value is interpreted in the
+   server's timezone. read_env_csv now stamps UTC, so all modalities
+   serialise identically.
+
+USAGE
+-----
+    nohup python3 "4. envt/env_step2_import.py" > env_import.log 2>&1 &
 """
 
-import json
-import csv
+import argparse
 import os
+import sys
 import time
-from datetime import timedelta
-import requests
-from env_aggregation_logic_v2 import read_env_csv, aggregate_env_column, RELEVANT_COLUMNS
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
-PERSON_ID_ATTR_UID = 'oFbmOHnKYaX'
-AI_READI_ROOT = '/home/jupyter-ainaperu/AI-READI-fixed'
-BATCH_SIZE = 500
-CHECKPOINT_FILE = 'env_checkpoint.json'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
+from common.checkpoint import Checkpoint  # noqa: E402
+from common.timeutil import format_display, hour_end, to_iso  # noqa: E402
 
-# Paste the full dict printed by env_step1_metadata.py here:
-STAGE_UIDS = {
-    'Environment – PM1': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – PM2.5': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – PM4': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – PM10': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – Humidity': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – Temperature': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – VOC': {'stage': 'REPLACE_ME', 'fields': {}},
-    'Environment – NOx': {'stage': 'REPLACE_ME', 'fields': {}},
+from env_aggregation_logic_v2 import (  # noqa: E402
+    RELEVANT_COLUMNS, aggregate_env_column, read_env_csv,
+)
+
+CHECKPOINT_FILE = "env_checkpoint.json"
+BATCH_SIZE = 200
+
+# Only humidity has extra threshold fields whose UIDs this repo recorded.
+# Temperature's are resolved by name alongside everything else.
+EXTRA_FIELD_NAMES = {
+    "hum": {
+        "above_count": "Humidity Above Comfort Range (>50%) - Count",
+        "above_ts": "Humidity Above Comfort Range (>50%) - Timestamps",
+        "below_count": "Humidity Below Comfort Range (<30%) - Count",
+        "below_ts": "Humidity Below Comfort Range (<30%) - Timestamps",
+    },
+    "temp": {
+        "above_count": "Temperature Above Study Comfort Range (>24C) - Count",
+        "above_ts": "Temperature Above Study Comfort Range (>24C) - Timestamps",
+        "below_count": "Temperature Below Study Comfort Range (<20C) - Count",
+        "below_ts": "Temperature Below Study Comfort Range (<20C) - Timestamps",
+    },
 }
 
-COLUMN_TO_STAGE = {
-    'pm1': 'Environment – PM1',
-    'pm2.5': 'Environment – PM2.5',
-    'pm4': 'Environment – PM4',
-    'pm10': 'Environment – PM10',
-    'hum': 'Environment – Humidity',
-    'temp': 'Environment – Temperature',
-    'voc': 'Environment – VOC',
-    'nox': 'Environment – NOx',
-}
 
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
-
-
-def load_manifest(path):
-    with open(path) as f:
-        return {row['person_id']: row for row in csv.DictReader(f, delimiter='\t')}
+def build_field_map(registry):
+    """Resolve every stage and field UID once, before any participant runs."""
+    base = registry.env_field_uids()
+    config = {}
+    for column in RELEVANT_COLUMNS:
+        fields = dict(base)
+        for key, name in EXTRA_FIELD_NAMES.get(column, {}).items():
+            uid = registry.maybe_data_element(name)
+            if uid:
+                fields[key] = uid
+        config[column] = {
+            "stage": registry.environment_stage(column),
+            "fields": fields,
+        }
+    return config
 
 
-def get_tei_info(person_id):
-    resp = session.get(
-        f'{DHIS2_URL}/api/tracker/trackedEntities',
-        params={'program': PROGRAM_UID, 'filter': f'{PERSON_ID_ATTR_UID}:eq:{person_id}',
-                'fields': 'trackedEntity,orgUnit,enrollments[enrollment]'},
-    )
-    resp.raise_for_status()
-    instances = resp.json().get('trackedEntities', [])
-    if not instances:
-        return None
-    tei = instances[0]
-    enrollment = tei['enrollments'][0]['enrollment'] if tei.get('enrollments') else None
-    return {'trackedEntity': tei['trackedEntity'], 'orgUnit': tei['orgUnit'], 'enrollment': enrollment}
-
-
-def fmt_dt(dt):
-    return dt.strftime('%Y-%m-%d %H:%M')
-
-
-def build_events_for_participant(person_id, tei_info, env_row):
-    fp_suffix = env_row.get('env_sensor_filepath')
-    if not fp_suffix or fp_suffix == 'None':
-        return []
-
-    full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-    try:
-        rows = read_env_csv(full_path)
-    except Exception as e:
-        print(f"  {person_id}: read error - {e}")
-        return []
-
+def build_events(config, context, rows):
     events = []
     for column in RELEVANT_COLUMNS:
-        stage_name = COLUMN_TO_STAGE[column]
-        cfg = STAGE_UIDS[stage_name]
-        hourly = aggregate_env_column(rows, column)
-
-        for hour, stats in hourly.items():
+        cfg = config[column]
+        for hour, stats in aggregate_env_column(rows, column).items():
             data_values = []
-            for field_key in ['mean', 'min', 'max', 'sd', 'count', 'above_count', 'above_ts',
-                               'below_count', 'below_ts']:
-                de_uid = cfg['fields'].get(field_key)
-                value = stats.get(field_key)
-                if de_uid and value is not None:
-                    data_values.append({'dataElement': de_uid, 'value': str(value)})
+            for key in ("mean", "min", "max", "sd", "count",
+                        "above_count", "above_ts", "below_count", "below_ts"):
+                entry = dhis2.data_value(cfg["fields"].get(key), stats.get(key))
+                if entry:
+                    data_values.append(entry)
 
-            hour_start_de = cfg['fields'].get('hour_start')
-            hour_end_de = cfg['fields'].get('hour_end')
-            if hour_start_de:
-                data_values.append({'dataElement': hour_start_de, 'value': fmt_dt(hour)})
-            if hour_end_de:
-                data_values.append({'dataElement': hour_end_de, 'value': fmt_dt(hour + timedelta(hours=1))})
+            for key, value in (("hour_start", format_display(hour)),
+                               ("hour_end", format_display(hour_end(hour)))):
+                entry = dhis2.data_value(cfg["fields"].get(key), value)
+                if entry:
+                    data_values.append(entry)
 
+            if not data_values:
+                continue
             events.append({
-                'program': PROGRAM_UID,
-                'programStage': cfg['stage'],
-                'trackedEntity': tei_info['trackedEntity'],
-                'enrollment': tei_info['enrollment'],
-                'orgUnit': tei_info['orgUnit'],
-                'occurredAt': hour.isoformat(),
-                'status': 'COMPLETED',
-                'dataValues': data_values,
+                "program": M.PROGRAM_UID,
+                "programStage": cfg["stage"],
+                "trackedEntity": context["trackedEntity"],
+                "enrollment": context["enrollment"],
+                "orgUnit": context["orgUnit"],
+                "occurredAt": to_iso(hour),
+                "status": "COMPLETED",
+                "dataValues": data_values,
             })
-
     return events
 
 
-def send_batch(events):
-    for i in range(0, len(events), BATCH_SIZE):
-        batch = events[i:i + BATCH_SIZE]
-        resp = session.post(f'{DHIS2_URL}/api/tracker',
-                             params={'async': 'false', 'importStrategy': 'CREATE'},
-                             json={'events': batch})
-        try:
-            status = resp.json().get('status', 'UNKNOWN')
-        except Exception:
-            status = f"HTTP {resp.status_code}"
-        if status not in ('OK', 'SUCCESS'):
-            print(f"    batch error: {resp.text[:500]}")
-
-
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
-    return {'completed': []}
-
-
-def save_checkpoint(cp):
-    with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(cp, f)
-
-
 def main():
-    env_manifest = load_manifest(f'{AI_READI_ROOT}/environment/manifest.tsv')
-    all_person_ids = sorted(env_manifest.keys())
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--person-id")
+    args, _ = parser.parse_known_args()
 
-    checkpoint = load_checkpoint()
-    completed = set(checkpoint['completed'])
-    remaining = [pid for pid in all_person_ids if pid not in completed]
-    print(f"Total: {len(all_person_ids)}, done: {len(completed)}, remaining: {len(remaining)}")
+    session = dhis2.get_session()
+    registry = M.load(session)
+    config = build_field_map(registry)
 
-    overall_start = time.time()
-    for idx, person_id in enumerate(remaining):
-        t0 = time.time()
-        tei_info = get_tei_info(person_id)
-        if tei_info is None:
-            print(f"[{idx+1}/{len(remaining)}] {person_id}: no TEI, skipping")
-            completed.add(person_id)
-            checkpoint['completed'] = list(completed)
-            save_checkpoint(checkpoint)
-            continue
+    manifest = aireadi.load_manifest("environment")
+    all_ids = sorted(manifest)
 
-        env_row = env_manifest.get(person_id, {})
-        events = build_events_for_participant(person_id, tei_info, env_row)
-        send_batch(events)
+    with Checkpoint(CHECKPOINT_FILE, flush_every=5) as checkpoint:
+        remaining = [args.person_id] if args.person_id else checkpoint.pending(all_ids)
+        if args.limit:
+            remaining = remaining[:args.limit]
+        print(f"Total {len(all_ids)}, {checkpoint.summary()}, {len(remaining)} to process")
+        start = time.time()
 
-        elapsed = time.time() - t0
-        completed.add(person_id)
-        checkpoint['completed'] = list(completed)
-        save_checkpoint(checkpoint)
+        for index, person_id in enumerate(remaining, start=1):
+            t0 = time.time()
+            try:
+                context = dhis2.get_tei_context(
+                    session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
+                )
+                if context is None:
+                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    continue
 
-        total_elapsed = time.time() - overall_start
-        print(f"[{idx+1}/{len(remaining)}] {person_id}: {len(events)} events, "
-              f"{elapsed:.1f}s (total: {total_elapsed/3600:.2f}h)")
+                rows = []
+                for row in manifest.get(person_id, []):
+                    path = aireadi.resolve("environment", row.get("env_sensor_filepath"))
+                    if path:
+                        rows.extend(read_env_csv(path))
 
-    print("\nALL PARTICIPANTS COMPLETE")
+                events = build_events(config, context, rows) if rows else []
+                if events:
+                    dhis2.send_events(session, events, "CREATE", batch_size=BATCH_SIZE)
+                checkpoint.mark_done(person_id)
+                print(f"[{index}/{len(remaining)}] {person_id}: {len(events)} events, "
+                      f"{time.time() - t0:.1f}s (total {(time.time() - start) / 3600:.2f}h)")
+
+            except Exception as exc:
+                checkpoint.mark_failed(person_id, exc)
+                print(f"[{index}/{len(remaining)}] {person_id}: FAILED, {str(exc)[:300]}")
+
+    print(f"\nRun complete. {checkpoint.summary()}")
+    return 1 if checkpoint.failed else 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

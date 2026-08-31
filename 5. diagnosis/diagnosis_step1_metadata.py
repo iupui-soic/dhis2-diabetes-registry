@@ -1,86 +1,51 @@
+#!/usr/bin/env python3
+"""Create the "Diagnosis History" program stage.
+
+One event per diagnosed condition per participant, sourced from
+clinical_data/condition_occurrence.csv in OMOP CDM format.
+
+Verified against the dataset (12,375 rows, 2,189 participants):
+  - condition_source_value is truncated at 49 characters in the AI-READI
+    export for longer descriptions. 3,388 rows sit at exactly 49. That is a
+    source limitation, imported as-is rather than reconstructed.
+  - condition_status_source_value and stop_reason are blank on every row, so
+    both are excluded.
+
+WHAT THE AUDIT FOUND (C-01, H-07), and what changed
+----------------------------------------------------
+Credentials come from the environment, and creation verifies its own result.
+
+USAGE
+-----
+    python3 "5. diagnosis/diagnosis_step1_metadata.py"
 """
-Creates the "Diagnosis History" Program Stage.
 
-One event per diagnosed condition per participant (repeatable stage).
-Sourced from clinical_data/condition_occurrence.csv (OMOP CDM format).
+import os
+import sys
 
-Note: condition_source_value is truncated at 49 characters in the raw
-AI-READI export for longer condition descriptions - a source-data
-limitation, imported as-is rather than guessed/reconstructed.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
 
-condition_status_source_value and stop_reason were checked and found
-100% blank across all 12,375 rows - excluded, no value to import.
+STAGE_NAME = "Diagnosis History"
 
-Run once. Prints field UIDs at the end - needed for the import script.
-"""
-
-import requests
-import json
-
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
-
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
-headers = {'Content-Type': 'application/json'}
-
-
-def create_data_elements(defs):
-    des = [
-        {'name': name, 'shortName': name[:50], 'domainType': 'TRACKER',
-         'valueType': vtype, 'aggregationType': 'NONE'}
-        for name, vtype in defs
-    ]
-    resp = session.post(f'{DHIS2_URL}/api/metadata', headers=headers, data=json.dumps({'dataElements': des}))
-    print(f"  Data elements: {resp.status_code}")
-    if resp.status_code not in (200, 201):
-        print(f"  ERROR: {resp.text[:500]}")
-    names = [d[0] for d in defs]
-    lookup = session.get(
-        f'{DHIS2_URL}/api/dataElements',
-        params={'filter': f'name:in:[{",".join(names)}]', 'fields': 'id,name'}
-    ).json()
-    return {de['name']: de['id'] for de in lookup.get('dataElements', [])}
-
-
-print("=== Creating data elements ===")
-defs = [
-    ('Diagnosis Condition Code', 'TEXT'),
-    ('Diagnosis Condition Label', 'LONG_TEXT'),
-    ('Diagnosis Date', 'TEXT'),
+FIELDS = [
+    {"name": "Diagnosis Condition Code", "valueType": "TEXT"},
+    {"name": "Diagnosis Condition Label", "valueType": "LONG_TEXT"},
+    {"name": "Diagnosis Date", "valueType": "TEXT"},
 ]
-field_uids = create_data_elements(defs)
-print(f"Field UIDs: {field_uids}\n")
 
-print("=== Creating stage: Diagnosis History ===")
-field_order = [field_uids[name] for name, _ in defs]
 
-stage_payload = {
-    'programStages': [{
-        'name': 'Diagnosis History',
-        'program': {'id': PROGRAM_UID},
-        'repeatable': True,
-        'featureType': 'NONE',
-        'programStageDataElements': [
-            {'dataElement': {'id': uid}, 'compulsory': False, 'sortOrder': i + 1}
-            for i, uid in enumerate(field_order)
-        ],
-    }]
-}
-resp = session.post(f'{DHIS2_URL}/api/metadata', headers=headers, data=json.dumps(stage_payload))
-print(f"  Stage created: {resp.status_code}")
-if resp.status_code not in (200, 201):
-    print(f"  ERROR: {resp.text[:500]}")
+def main():
+    session = dhis2.get_session()
+    uids = dhis2.create_data_elements(session, FIELDS)
+    for name, uid in uids.items():
+        print(f"{name}: {uid}")
+    ordered = [uids[d["name"]] for d in FIELDS]
+    stage_uid = dhis2.create_program_stage(session, STAGE_NAME, M.PROGRAM_UID, ordered)
+    print(f"\nStage {STAGE_NAME}: {stage_uid}")
+    print("diagnosis_step2_import.py resolves these by name.")
 
-lookup = session.get(
-    f'{DHIS2_URL}/api/programStages',
-    params={'filter': 'name:eq:Diagnosis History', 'fields': 'id,name'}
-).json()
-stage_uid = lookup['programStages'][0]['id'] if lookup.get('programStages') else None
-print(f"  Stage UID: {stage_uid}")
 
-print("\n\n=== SAVE THIS - needed for the import script ===")
-print(f"STAGE_UID = '{stage_uid}'")
-print(f"FIELD_UIDS = {json.dumps(field_uids, indent=2)}")
+if __name__ == "__main__":
+    main()

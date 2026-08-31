@@ -1,215 +1,165 @@
+#!/usr/bin/env python3
+"""Create the threshold, status, SD and timestamp fields for HR, RR and SpO2.
+
+Thresholds and their sources:
+  Heart Rate        <60 / 60-100 / >100 bpm
+                    American Heart Association, normal resting HR 60-100
+  Respiratory Rate  <12 / 12-20 / >20 breaths/min
+                    American Lung Association, normal adult resting RR 12-20
+  SpO2              95-100 normal / 90-94 mild low / <90 marked low
+                    WHO hypoxemia threshold
+
+Data Sufficiency is a project design decision, not a clinical standard:
+  0 valid readings -> No valid data, 1-2 -> Limited, 3+ -> Sufficient
+
+WHAT THE AUDIT FOUND (C-01, H-02, H-07), and what changed
+----------------------------------------------------------
+1. H-02 as originally reported was WRONG, and this is corrected here.
+   "Insufficient data" is defined in both the HR/RR and the SpO2 option set,
+   and the concern was that creating options standalone and resolving them by
+   a global name lookup would make the second set adopt the first set's
+   option. Checked against the live server: DHIS2 2.44 holds them as two
+   separate objects (jhiZJdtZDFy and bgaPE4PheLm) with the same name and the
+   same code, and both sets are intact. The display names are therefore left
+   as they were. Options are still created nested inside their set rather
+   than standalone, which is more robust, and codes stay plain so they match
+   what the instance already uses.
+
+2. H-07: neither the create response nor the lookup result was checked, so a
+   failed create produced None UIDs that were then written into a stage. Every
+   create now verifies that what it asked for exists.
+
+3. This module also exports the option set names, thresholds and field names
+   that threshold_step2_backfill.py imports, so the metadata definition and
+   the import can no longer drift apart.
+
+USAGE
+-----
+    python3 "2. wearable script/threshold_step1_metadata.py"
 """
-Adds threshold/status/timestamp fields to the existing Heart Rate,
-Respiratory Rate, and SpO2 stages.
 
-Thresholds used (cited sources):
-  - Heart Rate: <60 / 60-100 / >100 bpm
-      American Heart Association - normal resting HR is 60-100 bpm
-      https://www.heart.org/en/health-topics/high-blood-pressure/the-facts-about-high-blood-pressure/all-about-heart-rate-pulse
-  - Respiratory Rate: <12 / 12-20 / >20 breaths/min
-      American Lung Association - normal adult resting RR is 12-20 breaths/min
-      https://www.lung.org/blog/respiratory-rate-vital-signs
-  - SpO2: 95-100% (normal) / 90-94% (mild low) / <90% (marked low, WHO
-    hypoxemia threshold, widely cited in respiratory research)
+import os
+import sys
 
-Data Sufficiency rule (project-design decision, not a clinical standard):
-  0 valid readings -> No valid data
-  1-2 valid readings -> Limited
-  3+ valid readings -> Sufficient
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
 
-Run once. Prints all new field UIDs at the end - needed for the backfill script.
-"""
+# ---------------------------------------------------------------------------
+# Shared definitions. threshold_step2_backfill.py imports these.
+# ---------------------------------------------------------------------------
 
-import requests
-import json
+SUFFICIENCY_SET = "Data Sufficiency"
+HR_RR_STATUS_SET = "HR RR Hourly Threshold Status"
+SPO2_STATUS_SET = "SpO2 Hourly Threshold Status"
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
+SUFFICIENCY_OPTIONS = ["Sufficient", "Limited", "No valid data"]
 
-# Existing stage UIDs (from hourly_step2_final.py)
-STAGE_UIDS = {
-    'Wearable – Heart Rate': 'XB29GdXrNDb',
-    'Wearable – Respiratory Rate': 'ZHqSqHOv8is',
-    'Wearable – SpO2': 'QoigcBfYCcG',
+# "Insufficient data" deliberately appears in both sets. Verified safe: the
+# server holds them as two distinct options. See H-02 above.
+HR_RR_STATUS_OPTIONS = [
+    "Within range",
+    "Low readings present",
+    "High readings present",
+    "Both low and high readings present",
+    "Insufficient data",
+]
+SPO2_STATUS_OPTIONS = [
+    "Expected range only",
+    "Mild-low readings present",
+    "Marked-low readings present",
+    "Both mild-low and marked-low readings present",
+    "Insufficient data",
+]
+
+HR_THRESHOLDS = (60, 100)
+RR_THRESHOLDS = (12, 20)
+SPO2_MILD_LOW = 95      # 90 to below 95 is mild low
+SPO2_MARKED_LOW = 90    # below 90 is marked low
+
+FIELD_NAMES = {
+    "HR": {
+        "sd": "HR Standard Deviation",
+        "low_count": "HR Low Reading Count (<60)",
+        "high_count": "HR High Reading Count (>100)",
+        "status": "HR Hourly Status",
+        "sufficiency": "HR Data Sufficiency",
+        "low_ts": "HR Low Reading Timestamps",
+        "high_ts": "HR High Reading Timestamps",
+    },
+    "RR": {
+        "sd": "RR Standard Deviation",
+        "low_count": "RR Low Reading Count (<12)",
+        "high_count": "RR High Reading Count (>20)",
+        "status": "RR Hourly Status",
+        "sufficiency": "RR Data Sufficiency",
+        "low_ts": "RR Low Reading Timestamps",
+        "high_ts": "RR High Reading Timestamps",
+    },
+    "SPO2": {
+        "sd": "SpO2 Standard Deviation",
+        "mild_low_count": "SpO2 Mild Low Count (90-94)",
+        "marked_low_count": "SpO2 Marked Low Count (<90)",
+        "status": "SpO2 Hourly Status",
+        "sufficiency": "SpO2 Data Sufficiency",
+        "mild_low_ts": "SpO2 Mild Low Reading Timestamps",
+        "marked_low_ts": "SpO2 Marked Low Reading Timestamps",
+    },
 }
 
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
-headers = {'Content-Type': 'application/json'}
+VALUE_TYPES = {
+    "sd": "NUMBER",
+    "low_count": "INTEGER", "high_count": "INTEGER",
+    "mild_low_count": "INTEGER", "marked_low_count": "INTEGER",
+    "status": "TEXT", "sufficiency": "TEXT",
+    "low_ts": "LONG_TEXT", "high_ts": "LONG_TEXT",
+    "mild_low_ts": "LONG_TEXT", "marked_low_ts": "LONG_TEXT",
+}
 
 
-def create_option_set(name, options):
-    """Creates an option set with the given list of option names. Returns its UID."""
-    option_payload = {
-        'options': [
-            {'name': opt, 'code': opt.upper().replace(' ', '_').replace('-', '_')}
-            for opt in options
-        ]
+def field_names_for(metric):
+    """{field key: data element name} for one metric."""
+    return FIELD_NAMES[metric]
+
+
+def main():
+    session = dhis2.get_session()
+
+    print("Creating option sets")
+    sufficiency_uid = dhis2.create_option_set(session, SUFFICIENCY_SET, SUFFICIENCY_OPTIONS)
+    hr_rr_uid = dhis2.create_option_set(session, HR_RR_STATUS_SET, HR_RR_STATUS_OPTIONS)
+    spo2_uid = dhis2.create_option_set(session, SPO2_STATUS_SET, SPO2_STATUS_OPTIONS)
+    print(f"  {SUFFICIENCY_SET}: {sufficiency_uid}")
+    print(f"  {HR_RR_STATUS_SET}: {hr_rr_uid}")
+    print(f"  {SPO2_STATUS_SET}: {spo2_uid}")
+
+    option_set_for = {
+        "status": {"HR": hr_rr_uid, "RR": hr_rr_uid, "SPO2": spo2_uid},
+        "sufficiency": {"HR": sufficiency_uid, "RR": sufficiency_uid, "SPO2": sufficiency_uid},
     }
-    resp = session.post(f'{DHIS2_URL}/api/metadata', headers=headers,
-                         data=json.dumps(option_payload))
-    print(f"  Options for '{name}': {resp.status_code}")
 
-    option_lookup = session.get(
-        f'{DHIS2_URL}/api/options',
-        params={'filter': f'name:in:[{",".join(options)}]', 'fields': 'id,name'}
-    ).json()
-    option_ids = {o['name']: o['id'] for o in option_lookup.get('options', [])}
-
-    optionset_payload = {
-        'optionSets': [{
-            'name': name,
-            'valueType': 'TEXT',
-            'options': [{'id': option_ids[opt]} for opt in options if opt in option_ids],
-        }]
-    }
-    resp2 = session.post(f'{DHIS2_URL}/api/metadata', headers=headers,
-                          data=json.dumps(optionset_payload))
-    print(f"  Option set '{name}': {resp2.status_code}")
-
-    os_lookup = session.get(
-        f'{DHIS2_URL}/api/optionSets',
-        params={'filter': f'name:eq:{name}', 'fields': 'id,name'}
-    ).json()
-    os_id = os_lookup['optionSets'][0]['id'] if os_lookup.get('optionSets') else None
-    print(f"  Option set UID: {os_id}")
-    return os_id
-
-
-def create_data_elements(defs):
-    """defs: list of (name, valueType, aggregationType, optionSetUid_or_None). Returns {name: uid}."""
-    des = []
-    for name, vtype, agg, os_uid in defs:
-        de = {
-            'name': name, 'shortName': name[:50], 'domainType': 'TRACKER',
-            'valueType': vtype, 'aggregationType': agg,
-        }
-        if os_uid:
-            de['optionSet'] = {'id': os_uid}
-        des.append(de)
-
-    resp = session.post(f'{DHIS2_URL}/api/metadata', headers=headers,
-                         data=json.dumps({'dataElements': des}))
-    print(f"  Data elements: {resp.status_code}")
-    if resp.status_code not in (200, 201):
-        print(f"  ERROR: {resp.text[:500]}")
-
-    names = [d[0] for d in defs]
-    lookup = session.get(
-        f'{DHIS2_URL}/api/dataElements',
-        params={'filter': f'name:in:[{",".join(names)}]', 'fields': 'id,name'}
-    ).json()
-    return {de['name']: de['id'] for de in lookup.get('dataElements', [])}
-
-
-def attach_to_stage(stage_uid, field_uids_ordered):
-    """field_uids_ordered: list of (fieldKey, uid) - appends any not already present."""
-    stage_full = session.get(f'{DHIS2_URL}/api/programStages/{stage_uid}', params={'fields': '*'}).json()
-    existing_uids = {pde['dataElement']['id'] for pde in stage_full['programStageDataElements']}
-    max_sort = max((pde['sortOrder'] for pde in stage_full['programStageDataElements']), default=0)
-
-    added = 0
-    for _, uid in field_uids_ordered:
-        if uid and uid not in existing_uids:
-            max_sort += 1
-            stage_full['programStageDataElements'].append({
-                'dataElement': {'id': uid}, 'compulsory': False, 'sortOrder': max_sort,
+    for metric, stage_uid in M.THRESHOLD_STAGE_UIDS.items():
+        print(f"\nCreating fields for {metric}")
+        defs = []
+        for key, name in FIELD_NAMES[metric].items():
+            defs.append({
+                "name": name,
+                "shortName": name[:50],
+                "valueType": VALUE_TYPES[key],
+                "aggregationType": "SUM" if VALUE_TYPES[key] == "INTEGER" else "NONE",
+                "optionSet": option_set_for.get(key, {}).get(metric),
             })
-            added += 1
+        uids = dhis2.create_data_elements(session, defs)
+        for name, uid in uids.items():
+            print(f"  {name}: {uid}")
 
-    if added == 0:
-        print("  all fields already attached, skipping")
-        return
+        ordered = [uids[FIELD_NAMES[metric][k]] for k in FIELD_NAMES[metric]]
+        added = dhis2.attach_data_elements(session, stage_uid, ordered)
+        print(f"  attached {added} new field(s) to stage {stage_uid}")
 
-    resp = session.put(f'{DHIS2_URL}/api/programStages/{stage_uid}',
-                        headers=headers, data=json.dumps(stage_full))
-    print(f"  Attached {added} fields: {resp.status_code}")
+    print("\nDone. threshold_step2_backfill.py resolves these by name, so there "
+          "is nothing to paste anywhere.")
 
 
-# ============================================================
-# Step 1: shared option sets
-# ============================================================
-print("=== Creating Data Sufficiency option set (shared across all 3) ===")
-sufficiency_os = create_option_set(
-    'Data Sufficiency',
-    ['Sufficient', 'Limited', 'No valid data']
-)
-
-print("\n=== Creating HR/RR Hourly Status option set (shared) ===")
-hr_rr_status_os = create_option_set(
-    'HR RR Hourly Threshold Status',
-    ['Within range', 'Low readings present', 'High readings present',
-     'Both low and high readings present', 'Insufficient data']
-)
-
-print("\n=== Creating SpO2 Hourly Status option set ===")
-spo2_status_os = create_option_set(
-    'SpO2 Hourly Threshold Status',
-    ['Expected range only', 'Mild-low readings present', 'Marked-low readings present',
-     'Both mild-low and marked-low readings present', 'Insufficient data']
-)
-
-# ============================================================
-# Step 2: Heart Rate fields
-# ============================================================
-print("\n=== Creating Heart Rate fields ===")
-hr_defs = [
-    ('HR Standard Deviation', 'NUMBER', 'NONE', None),
-    ('HR Low Reading Count (<60)', 'INTEGER', 'SUM', None),
-    ('HR High Reading Count (>100)', 'INTEGER', 'SUM', None),
-    ('HR Hourly Status', 'TEXT', 'NONE', hr_rr_status_os),
-    ('HR Data Sufficiency', 'TEXT', 'NONE', sufficiency_os),
-    ('HR Low Reading Timestamps', 'LONG_TEXT', 'NONE', None),
-    ('HR High Reading Timestamps', 'LONG_TEXT', 'NONE', None),
-]
-hr_uids = create_data_elements(hr_defs)
-print(f"HR field UIDs: {hr_uids}")
-
-attach_to_stage(STAGE_UIDS['Wearable – Heart Rate'], list(hr_uids.items()))
-
-# ============================================================
-# Step 3: Respiratory Rate fields
-# ============================================================
-print("\n=== Creating Respiratory Rate fields ===")
-rr_defs = [
-    ('RR Standard Deviation', 'NUMBER', 'NONE', None),
-    ('RR Low Reading Count (<12)', 'INTEGER', 'SUM', None),
-    ('RR High Reading Count (>20)', 'INTEGER', 'SUM', None),
-    ('RR Hourly Status', 'TEXT', 'NONE', hr_rr_status_os),
-    ('RR Data Sufficiency', 'TEXT', 'NONE', sufficiency_os),
-    ('RR Low Reading Timestamps', 'LONG_TEXT', 'NONE', None),
-    ('RR High Reading Timestamps', 'LONG_TEXT', 'NONE', None),
-]
-rr_uids = create_data_elements(rr_defs)
-print(f"RR field UIDs: {rr_uids}")
-
-attach_to_stage(STAGE_UIDS['Wearable – Respiratory Rate'], list(rr_uids.items()))
-
-# ============================================================
-# Step 4: SpO2 fields
-# ============================================================
-print("\n=== Creating SpO2 fields ===")
-spo2_defs = [
-    ('SpO2 Standard Deviation', 'NUMBER', 'NONE', None),
-    ('SpO2 Mild Low Count (90-94)', 'INTEGER', 'SUM', None),
-    ('SpO2 Marked Low Count (<90)', 'INTEGER', 'SUM', None),
-    ('SpO2 Hourly Status', 'TEXT', 'NONE', spo2_status_os),
-    ('SpO2 Data Sufficiency', 'TEXT', 'NONE', sufficiency_os),
-    ('SpO2 Mild Low Reading Timestamps', 'LONG_TEXT', 'NONE', None),
-    ('SpO2 Marked Low Reading Timestamps', 'LONG_TEXT', 'NONE', None),
-]
-spo2_uids = create_data_elements(spo2_defs)
-print(f"SpO2 field UIDs: {spo2_uids}")
-
-attach_to_stage(STAGE_UIDS['Wearable – SpO2'], list(spo2_uids.items()))
-
-# ============================================================
-# Final summary
-# ============================================================
-print("\n\n=== ALL FIELD UIDS (save this for the backfill script) ===")
-print(json.dumps({
-    'Heart Rate': hr_uids,
-    'Respiratory Rate': rr_uids,
-    'SpO2': spo2_uids,
-}, indent=2))
+if __name__ == "__main__":
+    main()

@@ -1,61 +1,97 @@
+#!/usr/bin/env python3
+"""Post import_payload.json to DHIS2 in batches.
+
+WHAT THE AUDIT FOUND (C-01, M-14), and what changed
+---------------------------------------------------
+1. Credentials were hardcoded (admin/district against localhost). They now
+   come from the environment.
+
+2. A non-JSON response, such as a proxy error page, hit `break` and left the
+   batch loop. The script then printed a FINAL RESULT summary and, unless some
+   earlier batch happened to report ignored > 0, the message "No errors, every
+   participant imported successfully" even though it had stopped partway. It
+   now records the failure, continues with the remaining batches, and the
+   closing message reflects what actually happened.
+
+USAGE
+-----
+    python3 "1. core registry/send_to_dhis2.py" --payload import_payload.json
+"""
+
+import argparse
 import json
-import requests
+import os
+import sys
 
-DHIS2_URL = "http://localhost:8080"
-DHIS2_USER = "admin"
-DHIS2_PASSWORD = "district"
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import dhis2  # noqa: E402
 
-PROJECT_DIR = "/home/ainaperu/diabetes_registry_project"
-PAYLOAD_PATH = f"{PROJECT_DIR}/import_payload.json"
 BATCH_SIZE = 100
 
-with open(PAYLOAD_PATH) as f:
-    data = json.load(f)
 
-all_teis = data["trackedEntities"]
-print(f"Total participants to import: {len(all_teis)}")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--payload", default="import_payload.json")
+    parser.add_argument("--errors", default="import_errors.json")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    args, _ = parser.parse_known_args()
 
-total_created = 0
-total_ignored = 0
-error_log = []
+    with open(args.payload) as fh:
+        teis = json.load(fh)["trackedEntities"]
+    print(f"Total participants to import: {len(teis)}")
 
-for i in range(0, len(all_teis), BATCH_SIZE):
-    batch = all_teis[i:i + BATCH_SIZE]
-    batch_num = i // BATCH_SIZE + 1
-    total_batches = (len(all_teis) + BATCH_SIZE - 1) // BATCH_SIZE
+    session = dhis2.get_session()
 
-    response = requests.post(
-        f"{DHIS2_URL}/api/tracker",
-        json={"trackedEntities": batch},
-        auth=(DHIS2_USER, DHIS2_PASSWORD),
-        params={"async": "false", "importStrategy": "CREATE"},
-    )
+    total_created = 0
+    attempted = 0
+    failures = []
+    total_batches = (len(teis) + args.batch_size - 1) // args.batch_size
 
-    try:
-        result = response.json()
-    except ValueError:
-        print(f"Batch {batch_num}: non-JSON response, status {response.status_code}")
-        print(response.text[:500])
-        break
+    for i in range(0, len(teis), args.batch_size):
+        batch = teis[i:i + args.batch_size]
+        number = i // args.batch_size + 1
+        attempted += len(batch)
+        try:
+            stats = dhis2.import_tracker(
+                session, {"trackedEntities": batch}, "CREATE",
+                expect="created", expect_count=len(batch),
+            )
+        except dhis2.Dhis2Error as exc:
+            # Record and keep going. One bad batch is not a reason to abandon
+            # the remaining participants.
+            failures.append({
+                "batch": number,
+                "first_index": i,
+                "size": len(batch),
+                "error": str(exc),
+            })
+            print(f"Batch {number}/{total_batches}: FAILED, {str(exc)[:200]}")
+            continue
 
-    stats = result.get("stats", {})
-    created = stats.get("created", 0)
-    ignored = stats.get("ignored", 0)
+        total_created += stats["created"]
+        print(f"Batch {number}/{total_batches}: {stats['created']} created")
 
-    total_created += created
-    total_ignored += ignored
+    failed_records = sum(f["size"] for f in failures)
+    print()
+    print(f"Attempted: {attempted} of {len(teis)}")
+    print(f"Created:   {total_created}")
+    print(f"Failed:    {failed_records} in {len(failures)} batch(es)")
 
-    print(f"Batch {batch_num}/{total_batches}: {created} created, {ignored} ignored, http={response.status_code}")
+    if failures:
+        with open(args.errors, "w") as fh:
+            json.dump(failures, fh, indent=2)
+        print(f"\nDetails for {len(failures)} failed batch(es) written to {args.errors}.")
+        print("Re-run after fixing the cause. CREATE will reject anything already imported.")
+        return 1
 
-    if ignored > 0 or response.status_code >= 400:
-        error_log.append({"batch": batch_num, "response": result})
+    if total_created == len(teis):
+        print("\nEvery participant imported successfully.")
+        return 0
 
-print()
-print(f"FINAL RESULT: {total_created} created, {total_ignored} ignored out of {len(all_teis)}")
+    print(f"\nNo batch errored, but {len(teis) - total_created} participants were "
+          f"not created. Check the payload.")
+    return 1
 
-if error_log:
-    with open(f"{PROJECT_DIR}/import_errors.json", "w") as f:
-        json.dump(error_log, f, indent=2)
-    print(f"Saved details for {len(error_log)} problem batch(es) to import_errors.json")
-else:
-    print("No errors - every participant imported successfully!")
+
+if __name__ == "__main__":
+    sys.exit(main())

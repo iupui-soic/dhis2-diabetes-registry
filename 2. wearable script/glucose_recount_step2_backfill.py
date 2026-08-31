@@ -1,240 +1,175 @@
+#!/usr/bin/env python3
+"""Recompute the clinical above/below range fields on every CGM glucose event.
+
+Writes, per hourly event:
+  Above Range Timestamps and Count  (numeric >180 mg/dL, or device "High")
+  Below Range Timestamps and Count  (numeric <70 mg/dL,  or device "Low")
+
+Device High Count and Device Low Count are left alone. Those are the sensor's
+own out-of-measurable-range flags, which is a narrower concept.
+
+WHAT THE AUDIT FOUND (C-01, H-04, H-05, H-06), and what changed
+----------------------------------------------------------------
+H-04 was destructive here, and this is the most important change in the file.
+Hours were matched by comparing event["occurredAt"][:19] to a re-formatted
+source string. On a miss the old code still ran: it filtered the existing
+timestamp values out of the payload, only added them back when the recomputed
+string was non-empty, and wrote the counts unconditionally. A systematic key
+mismatch would therefore have cleared every timestamp field and stamped "0"
+into every count.
+
+Now hours are matched on instants through common.timeutil.hour_key, an event
+with no matching source hour is left untouched rather than zeroed, and a run
+that fails to match most of a participant's events aborts instead of writing.
+
+USAGE
+-----
+    nohup python3 "2. wearable script/glucose_recount_step2_backfill.py" > recount.log 2>&1 &
 """
-Step 2: recomputes and updates, for every existing CGM - Glucose event:
-  - Above Range Timestamps (>180 mg/dL, combined: numeric >180 OR device "High")
-  - Below Range Timestamps (<70 mg/dL, combined: numeric <70 OR device "Low")
-  - Above Range Count (matches the timestamp list length)
-  - Below Range Count (matches the timestamp list length)
 
-Device High Count / Device Low Count are NOT touched here - they were
-already correctly populated in the original import and represent a
-different, narrower concept (sensor's own measurable-range limit).
-
-If Above/Below Range Timestamps were already populated by the earlier
-(device-only) backfill, this OVERWRITES them with the corrected,
-combined-threshold version.
-
-Run in the background:
-    nohup python3 glucose_recount_step2_backfill.py > glucose_recount_log.txt 2>&1 &
-    tail -f glucose_recount_log.txt
-"""
-
+import argparse
 import json
-import csv
 import os
+import sys
 import time
-import requests
-from datetime import datetime
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
-PERSON_ID_ATTR_UID = 'oFbmOHnKYaX'
-AI_READI_ROOT = '/home/jupyter-ainaperu/AI-READI-fixed'
-GLUCOSE_STAGE_UID = 'SS7a20eCnBZ'
-BATCH_SIZE = 500
-CHECKPOINT_FILE = 'glucose_recount_checkpoint.json'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
+from common.checkpoint import Checkpoint  # noqa: E402
+from common.numeric import is_finite_number  # noqa: E402
+from common.timeutil import hour_key, time_only  # noqa: E402
 
-# Existing timestamp field UIDs (already created, now renamed)
-ABOVE_TS_DE = 'Zu4iFxtthSU'
-BELOW_TS_DE = 'LfzwHxQUotL'
+from hourly_aggregation_logic_final import (  # noqa: E402
+    GLUCOSE_RANGE_HIGH, GLUCOSE_RANGE_LOW, get_ts,
+)
 
-# From glucose_recount_step1_metadata.py's printed output:
-ABOVE_COUNT_DE = 'REPLACE_ME'
-BELOW_COUNT_DE = 'REPLACE_ME'
-
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
+CHECKPOINT_FILE = "glucose_recount_checkpoint.json"
 
 
-def load_manifest(path):
-    with open(path) as f:
-        return {row['person_id']: row for row in csv.DictReader(f, delimiter='\t')}
+def extract_raw(path):
+    with open(path) as fh:
+        data = json.load(fh)
+    return [
+        (get_ts(r["effective_time_frame"]), r["blood_glucose"]["value"])
+        for r in data["body"]["cgm"]
+    ]
 
 
-def get_ts(effective_time_frame):
-    if 'date_time' in effective_time_frame:
-        return effective_time_frame['date_time']
-    return effective_time_frame['time_interval']['start_date_time']
+def classify(readings):
+    """Split one hour's readings into above and below the clinical range.
+
+    Handles the device sentinels and ignores anything non-numeric that is not
+    a recognised sentinel, rather than comparing it to a number.
+    """
+    above, below = [], []
+    for ts, value in readings:
+        if value == "High":
+            above.append(ts)
+        elif value == "Low":
+            below.append(ts)
+        elif is_finite_number(value):
+            if value > GLUCOSE_RANGE_HIGH:
+                above.append(ts)
+            elif value < GLUCOSE_RANGE_LOW:
+                below.append(ts)
+    return above, below
 
 
-def parse_hour_bucket(ts_str):
-    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-    return dt.replace(minute=0, second=0, microsecond=0)
+def build_updates(session, tei_uid, bg_rows):
+    readings = []
+    for row in bg_rows:
+        path = aireadi.resolve("wearable_blood_glucose", row.get("glucose_filepath"))
+        if path:
+            readings.extend(extract_raw(path))
+    if not readings:
+        return [], 0
 
+    grouped = {}
+    for ts, value in readings:
+        grouped.setdefault(hour_key(ts), []).append((ts, value))
 
-def time_only(ts_str):
-    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-    return dt.strftime('%H:%M:%S')
-
-
-def extract_glucose_raw(fp):
-    with open(fp) as f:
-        data = json.load(f)
-    out = []
-    for r in data['body']['cgm']:
-        v = r['blood_glucose']['value']
-        ts = get_ts(r['effective_time_frame'])
-        out.append((ts, v))
-    return out
-
-
-def group_by_hour(readings):
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for ts, val in readings:
-        hour = parse_hour_bucket(ts)
-        key = hour.strftime('%Y-%m-%dT%H:%M:%S')
-        grouped[key].append((ts, val))
-    return grouped
-
-
-def get_tei_info(person_id):
-    resp = session.get(
-        f'{DHIS2_URL}/api/tracker/trackedEntities',
-        params={'program': PROGRAM_UID, 'filter': f'{PERSON_ID_ATTR_UID}:eq:{person_id}',
-                'fields': 'trackedEntity'},
+    events = dhis2.fetch_events(
+        session, M.PROGRAM_UID, M.CGM_GLUCOSE_STAGE_UID, tei_uid
     )
-    resp.raise_for_status()
-    instances = resp.json().get('trackedEntities', [])
-    return instances[0]['trackedEntity'] if instances else None
 
+    updates, unmatched = [], 0
+    for event in events:
+        hour_readings = grouped.get(hour_key(event["occurredAt"]))
+        if hour_readings is None:
+            # Leave the event exactly as it is. Writing zeroes here is what
+            # made the original version destructive.
+            unmatched += 1
+            continue
 
-def fetch_all_events(tei):
-    all_events = []
-    page = 1
-    while True:
-        resp = session.get(
-            f'{DHIS2_URL}/api/tracker/events',
-            params={
-                'program': PROGRAM_UID, 'programStage': GLUCOSE_STAGE_UID, 'trackedEntity': tei,
-                'pageSize': 1000, 'page': page,
-                'fields': 'event,orgUnit,enrollment,occurredAt,status,dataValues[dataElement,value]',
-            },
-        )
-        events = resp.json().get('events', [])
-        if not events:
-            break
-        all_events.extend(events)
-        page += 1
-    return all_events
+        above, below = classify(hour_readings)
+        changes = {
+            M.GLUCOSE_FIELD_UIDS["above_ts"]: ", ".join(time_only(t) for t in sorted(above)) or None,
+            M.GLUCOSE_FIELD_UIDS["below_ts"]: ", ".join(time_only(t) for t in sorted(below)) or None,
+            M.GLUCOSE_FIELD_UIDS["above_count"]: len(above),
+            M.GLUCOSE_FIELD_UIDS["below_count"]: len(below),
+        }
+        updates.append(dhis2.event_update_payload(
+            event, M.CGM_GLUCOSE_STAGE_UID, M.PROGRAM_UID,
+            dhis2.merge_data_values(event, changes),
+        ))
 
-
-def send_update_batch(events):
-    for i in range(0, len(events), BATCH_SIZE):
-        batch = events[i:i + BATCH_SIZE]
-        resp = session.post(
-            f'{DHIS2_URL}/api/tracker',
-            params={'importStrategy': 'UPDATE', 'async': 'false'},
-            json={'events': batch},
-        )
-        try:
-            status = resp.json().get('status', 'UNKNOWN')
-        except Exception:
-            status = f"HTTP {resp.status_code}"
-        if status not in ('OK', 'SUCCESS'):
-            print(f"    batch error: {resp.text[:500]}")
-
-
-def build_updates(tei, bg_row):
-    glu_suffix = bg_row.get('glucose_filepath')
-    if not glu_suffix or glu_suffix == 'None':
-        return []
-
-    full_path = f"{AI_READI_ROOT}{glu_suffix}" if glu_suffix.startswith('/') else f"{AI_READI_ROOT}/{glu_suffix}"
-    try:
-        readings = extract_glucose_raw(full_path)
-    except Exception as e:
-        print(f"    extraction error: {e}")
-        return []
-
-    grouped = group_by_hour(readings)
-    existing_events = fetch_all_events(tei)
-
-    updates = []
-    for event in existing_events:
-        occurred_key = event['occurredAt'][:19]
-        hour_readings = grouped.get(occurred_key, [])
-
-        below_readings = [ts for ts, v in hour_readings
-                           if v == 'Low' or (not isinstance(v, str) and v < 70)]
-        above_readings = [ts for ts, v in hour_readings
-                           if v == 'High' or (not isinstance(v, str) and v > 180)]
-
-        below_ts_str = ', '.join(time_only(ts) for ts in sorted(below_readings))
-        above_ts_str = ', '.join(time_only(ts) for ts in sorted(above_readings))
-
-        existing_dvs = [dv for dv in event['dataValues']
-                         if dv['dataElement'] not in (ABOVE_TS_DE, BELOW_TS_DE, ABOVE_COUNT_DE, BELOW_COUNT_DE)]
-
-        if above_ts_str:
-            existing_dvs.append({'dataElement': ABOVE_TS_DE, 'value': above_ts_str})
-        if below_ts_str:
-            existing_dvs.append({'dataElement': BELOW_TS_DE, 'value': below_ts_str})
-        existing_dvs.append({'dataElement': ABOVE_COUNT_DE, 'value': str(len(above_readings))})
-        existing_dvs.append({'dataElement': BELOW_COUNT_DE, 'value': str(len(below_readings))})
-
-        updates.append({
-            'event': event['event'],
-            'program': PROGRAM_UID,
-            'programStage': GLUCOSE_STAGE_UID,
-            'orgUnit': event['orgUnit'],
-            'enrollment': event.get('enrollment'),
-            'occurredAt': event['occurredAt'],
-            'status': event.get('status', 'COMPLETED'),
-            'dataValues': existing_dvs,
-        })
-
-    return updates
-
-
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
-    return {'completed': []}
-
-
-def save_checkpoint(cp):
-    with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(cp, f)
+    return updates, unmatched
 
 
 def main():
-    bg_manifest = load_manifest(f'{AI_READI_ROOT}/wearable_blood_glucose/manifest.tsv')
-    all_person_ids = sorted(bg_manifest.keys())
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--person-id")
+    parser.add_argument("--max-unmatched", type=float, default=0.2)
+    args, _ = parser.parse_known_args()
 
-    checkpoint = load_checkpoint()
-    completed = set(checkpoint['completed'])
-    remaining = [pid for pid in all_person_ids if pid not in completed]
-    print(f"Total: {len(all_person_ids)}, done: {len(completed)}, remaining: {len(remaining)}")
+    session = dhis2.get_session()
+    bg = aireadi.load_manifest("wearable_blood_glucose")
+    all_ids = sorted(bg)
 
-    overall_start = time.time()
-    for idx, person_id in enumerate(remaining):
-        t0 = time.time()
-        tei = get_tei_info(person_id)
-        if tei is None:
-            completed.add(person_id)
-            checkpoint['completed'] = list(completed)
-            save_checkpoint(checkpoint)
-            continue
+    with Checkpoint(CHECKPOINT_FILE, flush_every=5) as checkpoint:
+        remaining = [args.person_id] if args.person_id else checkpoint.pending(all_ids)
+        if args.limit:
+            remaining = remaining[:args.limit]
+        print(f"Total {len(all_ids)}, {checkpoint.summary()}, {len(remaining)} to process")
+        start = time.time()
 
-        bg_row = bg_manifest.get(person_id, {})
-        updates = build_updates(tei, bg_row)
-        if updates:
-            send_update_batch(updates)
+        for index, person_id in enumerate(remaining, start=1):
+            t0 = time.time()
+            try:
+                context = dhis2.get_tei_context(
+                    session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
+                )
+                if context is None:
+                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    continue
 
-        elapsed = time.time() - t0
-        completed.add(person_id)
-        checkpoint['completed'] = list(completed)
-        save_checkpoint(checkpoint)
+                updates, unmatched = build_updates(
+                    session, context["trackedEntity"], bg.get(person_id, [])
+                )
+                total = len(updates) + unmatched
+                if total and unmatched / total > args.max_unmatched:
+                    raise dhis2.Dhis2Error(
+                        f"{unmatched} of {total} events had no matching source hour, "
+                        f"which is above --max-unmatched. Refusing to write, because "
+                        f"this usually means the hour keys are misaligned."
+                    )
 
-        total_elapsed = time.time() - overall_start
-        print(f"[{idx+1}/{len(remaining)}] {person_id}: {len(updates)} events updated, "
-              f"{elapsed:.1f}s (total: {total_elapsed/3600:.2f}h)")
+                if updates:
+                    dhis2.send_events(session, updates, "UPDATE")
+                checkpoint.mark_done(person_id)
+                print(f"[{index}/{len(remaining)}] {person_id}: {len(updates)} updated, "
+                      f"{unmatched} unmatched, {time.time() - t0:.1f}s "
+                      f"(total {(time.time() - start) / 3600:.2f}h)")
 
-    print("\nALL PARTICIPANTS COMPLETE")
+            except Exception as exc:
+                checkpoint.mark_failed(person_id, exc)
+                print(f"[{index}/{len(remaining)}] {person_id}: FAILED, {str(exc)[:300]}")
+
+    print(f"\nRun complete. {checkpoint.summary()}")
+    return 1 if checkpoint.failed else 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

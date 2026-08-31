@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Credentials. Never commit these.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets.json
+credentials.json
+*.pem
+*.key
+.netrc
+
+# ---------------------------------------------------------------------------
+# Run artefacts. These are outputs, not source, and some grow to tens of MB.
+# ---------------------------------------------------------------------------
+*_checkpoint.json
+*_checkpoint_*.json
+*.pre-audit-backup
+stage_count_cache.json
+metadata_uid_cache.json
+retinal_metadata_uids.json
+uid_lookup.json
+import_payload.json
+import_errors.json
+*.log
+*_affected_patients.csv
+corrupted_file_patients.csv
+
+# ---------------------------------------------------------------------------
+# Study data. The AI-READI dataset is access-controlled and must never be
+# committed. It lives on the server at /data0/AI-READI.
+# ---------------------------------------------------------------------------
+AI-READI/
+AI-READI-fixed/
+*.dcm
+*.hea
+*.dat
+registry_master_*.csv
+participants.tsv
+manifest.tsv
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

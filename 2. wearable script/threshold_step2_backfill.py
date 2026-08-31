@@ -1,379 +1,250 @@
+#!/usr/bin/env python3
+"""Backfill threshold, status, SD and timestamp fields onto HR, RR and SpO2 events.
+
+WHAT THE AUDIT FOUND (C-01, H-01, H-04, H-05, H-06), and what changed
+---------------------------------------------------------------------
+1. H-01 was overstated, and this is corrected here. This script wrote the
+   option display name while the metadata script generated codes. Checked
+   against the live server: the stored values are codes (WITHIN_RANGE,
+   SUFFICIENT), so DHIS2 2.44 resolved the name rather than rejecting it, and
+   no data was lost. Values now go through dhis2.option_value, which reads
+   the real code from the server, so the write no longer relies on that
+   leniency and cannot drift from the metadata.
+
+2. H-04: hours were matched by comparing event["occurredAt"][:19] against a
+   re-formatted source string. That works only while every side happens to
+   render UTC. Both sides now go through common.timeutil.hour_key, which
+   compares instants.
+
+3. H-05 and H-06: the paging loop returned [] on an HTTP error, and the
+   participant was checkpointed complete regardless of whether anything was
+   written. Both are fixed in common.
+
+4. A tracker UPDATE replaces an event's data values, so every update now
+   carries the event's existing values merged with the new ones.
+
+USAGE
+-----
+    nohup python3 "2. wearable script/threshold_step2_backfill.py" > threshold.log 2>&1 &
 """
-Backfills threshold/status/SD/timestamp fields onto every existing Heart
-Rate, Respiratory Rate, and SpO2 event. This is an UPDATE - existing
-values (Mean, Min, Max, Count, Hour Start, Hour End) are preserved.
 
-For each hourly event, re-reads the participant's RAW source file to
-recompute which individual readings fall in that specific hour, then:
-  - classifies each into low/within/high (or expected/mild-low/marked-low
-    for SpO2)
-  - computes standard deviation
-  - builds the comma-separated timestamp lists for flagged readings
-  - determines Hourly Status and Data Sufficiency
-
-Run in the background - re-reads raw files for every participant again.
-
-    nohup python3 threshold_step2_backfill.py > threshold_backfill_log.txt 2>&1 &
-    tail -f threshold_backfill_log.txt
-"""
-
-import json
-import csv
+import argparse
 import os
+import sys
 import time
-import math
-import requests
-from datetime import datetime, timedelta
-from collections import defaultdict
 
-DHIS2_URL = 'https://t2d-registry.plhi.us'
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'REPLACE_ME'
-PROGRAM_UID = 'W3LSFZH3UDq'
-PERSON_ID_ATTR_UID = 'oFbmOHnKYaX'
-AI_READI_ROOT = '/home/jupyter-ainaperu/AI-READI-fixed'
-BATCH_SIZE = 500
-CHECKPOINT_FILE = 'threshold_backfill_checkpoint.json'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dhis2  # noqa: E402
+from common import metadata_uids as M  # noqa: E402
+from common.checkpoint import Checkpoint  # noqa: E402
+from common.numeric import safe_round  # noqa: E402
+from common.timeutil import hour_key, time_only  # noqa: E402
 
-STAGE_UID = {
-    'HR': 'XB29GdXrNDb',
-    'RR': 'ZHqSqHOv8is',
-    'SPO2': 'QoigcBfYCcG',
+from hourly_aggregation_logic_final import (  # noqa: E402
+    extract_heart_rate, extract_oxygen_saturation, extract_respiratory_rate,
+)
+from threshold_step1_metadata import (  # noqa: E402
+    HR_RR_STATUS_SET, SPO2_STATUS_SET, SUFFICIENCY_SET,
+    HR_THRESHOLDS, RR_THRESHOLDS, SPO2_MARKED_LOW, SPO2_MILD_LOW,
+    field_names_for,
+)
+
+CHECKPOINT_FILE = "threshold_backfill_checkpoint.json"
+
+METRICS = {
+    "HR": ("heartrate_filepath", extract_heart_rate, M.WEARABLE_HEART_RATE_STAGE_UID),
+    "RR": ("respiratory_rate_filepath", extract_respiratory_rate,
+           M.WEARABLE_RESPIRATORY_RATE_STAGE_UID),
+    "SPO2": ("oxygen_saturation_filepath", extract_oxygen_saturation,
+             M.WEARABLE_SPO2_STAGE_UID),
 }
 
-# Paste from threshold_step1_metadata.py's printed output:
-FIELD_UIDS = {
-    'HR': {
-        'sd': 'REPLACE_ME', 'low_count': 'REPLACE_ME', 'high_count': 'REPLACE_ME',
-        'status': 'REPLACE_ME', 'sufficiency': 'REPLACE_ME',
-        'low_ts': 'REPLACE_ME', 'high_ts': 'REPLACE_ME',
-    },
-    'RR': {
-        'sd': 'REPLACE_ME', 'low_count': 'REPLACE_ME', 'high_count': 'REPLACE_ME',
-        'status': 'REPLACE_ME', 'sufficiency': 'REPLACE_ME',
-        'low_ts': 'REPLACE_ME', 'high_ts': 'REPLACE_ME',
-    },
-    'SPO2': {
-        'sd': 'REPLACE_ME', 'mild_low_count': 'REPLACE_ME', 'marked_low_count': 'REPLACE_ME',
-        'status': 'REPLACE_ME', 'sufficiency': 'REPLACE_ME',
-        'mild_low_ts': 'REPLACE_ME', 'marked_low_ts': 'REPLACE_ME',
-    },
-}
 
-session = requests.Session()
-session.auth = (ADMIN_USER, ADMIN_PASS)
+def sufficiency(count):
+    """Project-defined rule, not a clinical standard."""
+    if count == 0:
+        return "No valid data"
+    if count <= 2:
+        return "Limited"
+    return "Sufficient"
 
 
-def load_manifest(path):
-    with open(path) as f:
-        return {row['person_id']: row for row in csv.DictReader(f, delimiter='\t')}
+def standard_deviation(values):
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return safe_round(variance ** 0.5, 2)
 
 
-def get_ts(effective_time_frame):
-    if 'date_time' in effective_time_frame:
-        return effective_time_frame['date_time']
-    return effective_time_frame['time_interval']['start_date_time']
+def compute_hr_rr(readings, low_threshold, high_threshold):
+    values = [v for _, v in readings]
+    low = [(ts, v) for ts, v in readings if v < low_threshold]
+    high = [(ts, v) for ts, v in readings if v > high_threshold]
+
+    if not values:
+        status = "Insufficient data"
+    elif low and high:
+        status = "Both low and high readings present"
+    elif low:
+        status = "Low readings present"
+    elif high:
+        status = "High readings present"
+    else:
+        status = "Within range"
+
+    return {
+        "sd": standard_deviation(values),
+        "low_count": len(low),
+        "high_count": len(high),
+        "status": dhis2.option_value(HR_RR_STATUS_SET, status),
+        "sufficiency": dhis2.option_value(SUFFICIENCY_SET, sufficiency(len(values))),
+        "low_ts": ", ".join(time_only(ts) for ts, _ in sorted(low)) or None,
+        "high_ts": ", ".join(time_only(ts) for ts, _ in sorted(high)) or None,
+    }
 
 
-def parse_hour_bucket(ts_str):
-    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-    return dt.replace(minute=0, second=0, microsecond=0)
+def compute_spo2(readings):
+    values = [v for _, v in readings]
+    mild = [(ts, v) for ts, v in readings if SPO2_MARKED_LOW <= v < SPO2_MILD_LOW]
+    marked = [(ts, v) for ts, v in readings if v < SPO2_MARKED_LOW]
 
+    if not values:
+        status = "Insufficient data"
+    elif mild and marked:
+        status = "Both mild-low and marked-low readings present"
+    elif marked:
+        status = "Marked-low readings present"
+    elif mild:
+        status = "Mild-low readings present"
+    else:
+        status = "Expected range only"
 
-def time_only(ts_str):
-    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-    return dt.strftime('%H:%M:%S')
-
-
-def extract_heart_rate(fp):
-    with open(fp) as f:
-        data = json.load(f)
-    out = []
-    for r in data['body']['heart_rate']:
-        v = r['heart_rate']['value']
-        if v is not None and v > 0:
-            out.append((get_ts(r['effective_time_frame']), v))
-    return out
-
-
-def extract_respiratory_rate(fp):
-    with open(fp) as f:
-        data = json.load(f)
-    out = []
-    for r in data['body']['breathing']:
-        if 'respiratory_rate' in r:
-            v = r['respiratory_rate']['value']
-            if v is not None and v >= 0:
-                out.append((get_ts(r['effective_time_frame']), v))
-    return out
-
-
-def extract_oxygen_saturation(fp):
-    with open(fp) as f:
-        data = json.load(f)
-    out = []
-    for r in data['body']['breathing']:
-        if 'oxygen_saturation' in r:
-            v = r['oxygen_saturation']['value']
-            if v is not None and not (isinstance(v, float) and math.isnan(v)):
-                out.append((get_ts(r['effective_time_frame']), v))
-    return out
+    return {
+        "sd": standard_deviation(values),
+        "mild_low_count": len(mild),
+        "marked_low_count": len(marked),
+        "status": dhis2.option_value(SPO2_STATUS_SET, status),
+        "sufficiency": dhis2.option_value(SUFFICIENCY_SET, sufficiency(len(values))),
+        "mild_low_ts": ", ".join(time_only(ts) for ts, _ in sorted(mild)) or None,
+        "marked_low_ts": ", ".join(time_only(ts) for ts, _ in sorted(marked)) or None,
+    }
 
 
 def group_by_hour(readings):
-    """readings: list of (ts, value). Returns {hour_iso_no_tz: [(ts, value), ...]}"""
-    grouped = defaultdict(list)
-    for ts, val in readings:
-        hour = parse_hour_bucket(ts)
-        key = hour.strftime('%Y-%m-%dT%H:%M:%S')
-        grouped[key].append((ts, val))
+    grouped = {}
+    for ts, value in readings:
+        grouped.setdefault(hour_key(ts), []).append((ts, value))
     return grouped
 
 
-def compute_hr_rr_fields(readings_this_hour, low_thresh, high_thresh):
-    values = [v for ts, v in readings_this_hour]
-    count = len(values)
-
-    if count == 0:
-        sufficiency = 'No valid data'
-    elif count <= 2:
-        sufficiency = 'Limited'
-    else:
-        sufficiency = 'Sufficient'
-
-    low_readings = [(ts, v) for ts, v in readings_this_hour if v < low_thresh]
-    high_readings = [(ts, v) for ts, v in readings_this_hour if v > high_thresh]
-
-    sd = None
-    if count > 1:
-        mean = sum(values) / count
-        variance = sum((v - mean) ** 2 for v in values) / count
-        sd = round(variance ** 0.5, 2)
-
-    if count == 0:
-        status = 'Insufficient data'
-    elif low_readings and high_readings:
-        status = 'Both low and high readings present'
-    elif low_readings:
-        status = 'Low readings present'
-    elif high_readings:
-        status = 'High readings present'
-    else:
-        status = 'Within range'
-
-    low_ts_str = ', '.join(time_only(ts) for ts, v in sorted(low_readings, key=lambda x: x[0]))
-    high_ts_str = ', '.join(time_only(ts) for ts, v in sorted(high_readings, key=lambda x: x[0]))
-
-    return {
-        'sd': sd,
-        'low_count': len(low_readings),
-        'high_count': len(high_readings),
-        'status': status,
-        'sufficiency': sufficiency,
-        'low_ts': low_ts_str if low_ts_str else None,
-        'high_ts': high_ts_str if high_ts_str else None,
+def build_updates(session, registry, metric, tei_uid, wam_rows):
+    column, extractor, stage_uid = METRICS[metric]
+    field_uids = {
+        key: registry.data_element(name)
+        for key, name in field_names_for(metric).items()
     }
 
-
-def compute_spo2_fields(readings_this_hour):
-    values = [v for ts, v in readings_this_hour]
-    count = len(values)
-
-    if count == 0:
-        sufficiency = 'No valid data'
-    elif count <= 2:
-        sufficiency = 'Limited'
-    else:
-        sufficiency = 'Sufficient'
-
-    mild_low = [(ts, v) for ts, v in readings_this_hour if 90 <= v < 95]
-    marked_low = [(ts, v) for ts, v in readings_this_hour if v < 90]
-
-    sd = None
-    if count > 1:
-        mean = sum(values) / count
-        variance = sum((v - mean) ** 2 for v in values) / count
-        sd = round(variance ** 0.5, 2)
-
-    if count == 0:
-        status = 'Insufficient data'
-    elif mild_low and marked_low:
-        status = 'Both mild-low and marked-low readings present'
-    elif marked_low:
-        status = 'Marked-low readings present'
-    elif mild_low:
-        status = 'Mild-low readings present'
-    else:
-        status = 'Expected range only'
-
-    mild_ts_str = ', '.join(time_only(ts) for ts, v in sorted(mild_low, key=lambda x: x[0]))
-    marked_ts_str = ', '.join(time_only(ts) for ts, v in sorted(marked_low, key=lambda x: x[0]))
-
-    return {
-        'sd': sd,
-        'mild_low_count': len(mild_low),
-        'marked_low_count': len(marked_low),
-        'status': status,
-        'sufficiency': sufficiency,
-        'mild_low_ts': mild_ts_str if mild_ts_str else None,
-        'marked_low_ts': marked_ts_str if marked_ts_str else None,
-    }
-
-
-def get_tei_info(person_id):
-    resp = session.get(
-        f'{DHIS2_URL}/api/tracker/trackedEntities',
-        params={'program': PROGRAM_UID, 'filter': f'{PERSON_ID_ATTR_UID}:eq:{person_id}',
-                'fields': 'trackedEntity'},
-    )
-    resp.raise_for_status()
-    instances = resp.json().get('trackedEntities', [])
-    return instances[0]['trackedEntity'] if instances else None
-
-
-def fetch_all_events(tei, stage_uid):
-    all_events = []
-    page = 1
-    while True:
-        resp = session.get(
-            f'{DHIS2_URL}/api/tracker/events',
-            params={
-                'program': PROGRAM_UID, 'programStage': stage_uid, 'trackedEntity': tei,
-                'pageSize': 1000, 'page': page,
-                'fields': 'event,orgUnit,enrollment,occurredAt,status,dataValues[dataElement,value]',
-            },
-        )
-        events = resp.json().get('events', [])
-        if not events:
-            break
-        all_events.extend(events)
-        page += 1
-    return all_events
-
-
-def send_update_batch(events):
-    for i in range(0, len(events), BATCH_SIZE):
-        batch = events[i:i + BATCH_SIZE]
-        resp = session.post(
-            f'{DHIS2_URL}/api/tracker',
-            params={'importStrategy': 'UPDATE', 'async': 'false'},
-            json={'events': batch},
-        )
-        try:
-            status = resp.json().get('status', 'UNKNOWN')
-        except Exception:
-            status = f"HTTP {resp.status_code}"
-        if status not in ('OK', 'SUCCESS'):
-            print(f"    batch error: {resp.text[:500]}")
-
-
-def build_update_for_stage(metric_key, tei, wam_row, stage_uid):
-    """Returns list of event update payloads for one metric/stage/participant."""
-    col_map = {
-        'HR': ('heartrate_filepath', extract_heart_rate),
-        'RR': ('respiratory_rate_filepath', extract_respiratory_rate),
-        'SPO2': ('oxygen_saturation_filepath', extract_oxygen_saturation),
-    }
-    col, extractor = col_map[metric_key]
-    fp_suffix = wam_row.get(col)
-    if not fp_suffix or fp_suffix == 'None':
-        return []
-
-    full_path = f"{AI_READI_ROOT}{fp_suffix}" if fp_suffix.startswith('/') else f"{AI_READI_ROOT}/{fp_suffix}"
-    try:
-        readings = extractor(full_path)
-    except Exception as e:
-        print(f"    extraction error: {e}")
-        return []
+    # Every manifest row, not just the first: a participant can have more
+    # than one wearable period.
+    readings = []
+    for row in wam_rows:
+        path = aireadi.resolve("wearable_activity_monitor", row.get(column))
+        if path:
+            readings.extend(extractor(path))
+    if not readings:
+        return [], 0
 
     grouped = group_by_hour(readings)
+    events = dhis2.fetch_events(session, M.PROGRAM_UID, stage_uid, tei_uid)
 
-    existing_events = fetch_all_events(tei, stage_uid)
+    updates, unmatched = [], 0
+    for event in events:
+        key = hour_key(event["occurredAt"])
+        hour_readings = grouped.get(key)
+        if hour_readings is None:
+            # No source hour for this event. Do not write "no valid data"
+            # over it, because that would be indistinguishable from a genuine
+            # empty hour. Count it and let the caller decide.
+            unmatched += 1
+            continue
 
-    updates = []
-    for event in existing_events:
-        occurred_key = event['occurredAt'][:19]  # strip ms/tz
-        hour_readings = grouped.get(occurred_key, [])
+        computed = (compute_spo2(hour_readings) if metric == "SPO2"
+                    else compute_hr_rr(hour_readings,
+                                       *(HR_THRESHOLDS if metric == "HR" else RR_THRESHOLDS)))
 
-        if metric_key == 'SPO2':
-            computed = compute_spo2_fields(hour_readings)
-        else:
-            thresholds = {'HR': (60, 100), 'RR': (12, 20)}[metric_key]
-            computed = compute_hr_rr_fields(hour_readings, *thresholds)
+        changes = {field_uids[k]: v for k, v in computed.items() if k in field_uids}
+        updates.append(dhis2.event_update_payload(
+            event, stage_uid, M.PROGRAM_UID,
+            dhis2.merge_data_values(event, changes),
+        ))
 
-        fields = FIELD_UIDS[metric_key]
-        existing_dvs = list(event['dataValues'])
-        existing_de_ids = {dv['dataElement'] for dv in existing_dvs}
-
-        for field_key, value in computed.items():
-            de_uid = fields.get(field_key)
-            if de_uid and de_uid not in existing_de_ids and value is not None:
-                existing_dvs.append({'dataElement': de_uid, 'value': str(value)})
-
-        updates.append({
-            'event': event['event'],
-            'program': PROGRAM_UID,
-            'programStage': stage_uid,
-            'orgUnit': event['orgUnit'],
-            'enrollment': event.get('enrollment'),
-            'occurredAt': event['occurredAt'],
-            'status': event.get('status', 'COMPLETED'),
-            'dataValues': existing_dvs,
-        })
-
-    return updates
-
-
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
-    return {'completed': []}
-
-
-def save_checkpoint(cp):
-    with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(cp, f)
+    return updates, unmatched
 
 
 def main():
-    wam_manifest = load_manifest(f'{AI_READI_ROOT}/wearable_activity_monitor/manifest.tsv')
-    all_person_ids = sorted(wam_manifest.keys())
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--person-id")
+    parser.add_argument("--max-unmatched", type=float, default=0.2,
+                        help="abort a participant if more than this fraction of "
+                             "their events have no matching source hour")
+    args, _ = parser.parse_known_args()
 
-    checkpoint = load_checkpoint()
-    completed = set(checkpoint['completed'])
-    remaining = [pid for pid in all_person_ids if pid not in completed]
-    print(f"Total: {len(all_person_ids)}, done: {len(completed)}, remaining: {len(remaining)}")
+    session = dhis2.get_session()
+    registry = M.load(session)
+    wam = aireadi.load_manifest("wearable_activity_monitor")
+    all_ids = sorted(wam)
 
-    overall_start = time.time()
-    for idx, person_id in enumerate(remaining):
-        t0 = time.time()
-        tei = get_tei_info(person_id)
-        if tei is None:
-            completed.add(person_id)
-            checkpoint['completed'] = list(completed)
-            save_checkpoint(checkpoint)
-            continue
+    with Checkpoint(CHECKPOINT_FILE, flush_every=5) as checkpoint:
+        remaining = [args.person_id] if args.person_id else checkpoint.pending(all_ids)
+        if args.limit:
+            remaining = remaining[:args.limit]
+        print(f"Total {len(all_ids)}, {checkpoint.summary()}, {len(remaining)} to process")
+        start = time.time()
 
-        wam_row = wam_manifest.get(person_id, {})
-        total_updated = 0
-        for metric_key in ['HR', 'RR', 'SPO2']:
-            updates = build_update_for_stage(metric_key, tei, wam_row, STAGE_UID[metric_key])
-            if updates:
-                send_update_batch(updates)
-                total_updated += len(updates)
+        for index, person_id in enumerate(remaining, start=1):
+            t0 = time.time()
+            try:
+                context = dhis2.get_tei_context(
+                    session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
+                )
+                if context is None:
+                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    continue
 
-        elapsed = time.time() - t0
-        completed.add(person_id)
-        checkpoint['completed'] = list(completed)
-        save_checkpoint(checkpoint)
+                total_updated, total_unmatched, total_events = 0, 0, 0
+                for metric in METRICS:
+                    updates, unmatched = build_updates(
+                        session, registry, metric,
+                        context["trackedEntity"], wam.get(person_id, []),
+                    )
+                    total_unmatched += unmatched
+                    total_events += len(updates) + unmatched
+                    if updates:
+                        dhis2.send_events(session, updates, "UPDATE")
+                        total_updated += len(updates)
 
-        total_elapsed = time.time() - overall_start
-        print(f"[{idx+1}/{len(remaining)}] {person_id}: {total_updated} events updated, "
-              f"{elapsed:.1f}s (total: {total_elapsed/3600:.2f}h)")
+                if total_events and total_unmatched / total_events > args.max_unmatched:
+                    raise dhis2.Dhis2Error(
+                        f"{total_unmatched} of {total_events} events had no matching "
+                        f"source hour. That is above --max-unmatched, which usually "
+                        f"means the hour keys are misaligned rather than that data is "
+                        f"genuinely missing. Not marking this participant complete."
+                    )
 
-    print("\nALL PARTICIPANTS COMPLETE")
+                checkpoint.mark_done(person_id)
+                print(f"[{index}/{len(remaining)}] {person_id}: {total_updated} updated, "
+                      f"{total_unmatched} unmatched, {time.time() - t0:.1f}s "
+                      f"(total {(time.time() - start) / 3600:.2f}h)")
+
+            except Exception as exc:
+                checkpoint.mark_failed(person_id, exc)
+                print(f"[{index}/{len(remaining)}] {person_id}: FAILED, {str(exc)[:300]}")
+
+    print(f"\nRun complete. {checkpoint.summary()}")
+    return 1 if checkpoint.failed else 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

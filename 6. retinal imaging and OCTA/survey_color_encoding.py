@@ -15,19 +15,20 @@ USAGE:
 """
 
 import os
+import sys
 from collections import Counter, defaultdict
 
 import pandas as pd
-import pydicom
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi, dicom  # noqa: E402  (reports a clear error if pydicom is absent)
 
-AI_READI_ROOT = os.path.expanduser("~/AI-READI-fixed")
-PHOTOGRAPHY_MANIFEST = os.path.join(AI_READI_ROOT, "retinal_photography", "manifest.tsv")
-OCTA_MANIFEST = os.path.join(AI_READI_ROOT, "retinal_octa", "manifest.tsv")
+import pydicom  # noqa: E402
+
 
 SAMPLES_PER_GROUP = 3  # how many files to check per manufacturer+model+imaging combo
 
 
-def sample_and_check(df, filepath_col, label):
+def sample_and_check(df, filepath_col, label, modality):
     print(f"\n{'=' * 70}")
     print(f"{label}")
     print('=' * 70)
@@ -49,8 +50,8 @@ def sample_and_check(df, filepath_col, label):
             rel_path = row.get(filepath_col)
             if pd.isna(rel_path) or str(rel_path).strip().lower() == "not reported":
                 continue
-            full_path = os.path.join(AI_READI_ROOT, str(rel_path).lstrip("/"))
-            if not os.path.exists(full_path):
+            full_path = aireadi.resolve(modality, rel_path)
+            if full_path is None:
                 continue
             try:
                 ds = pydicom.dcmread(full_path, stop_before_pixels=True)
@@ -70,11 +71,11 @@ def sample_and_check(df, filepath_col, label):
 
 print("Reading manifests (read-only, safe alongside the running import)...")
 
-photo_df = pd.read_csv(PHOTOGRAPHY_MANIFEST, sep="\t")
-sample_and_check(photo_df, "filepath", "RETINAL PHOTOGRAPHY")
+photo_df = pd.read_csv(aireadi.manifest_path("retinal_photography"), sep="\t")
+sample_and_check(photo_df, "filepath", "RETINAL PHOTOGRAPHY", "retinal_photography")
 
-octa_df = pd.read_csv(OCTA_MANIFEST, sep="\t")
-sample_and_check(octa_df, "associated_enface_1_file_path", "OCTA ENFACE (slot 1 sample)")
+octa_df = pd.read_csv(aireadi.manifest_path("retinal_octa"), sep="\t")
+sample_and_check(octa_df, "associated_enface_1_file_path", "OCTA ENFACE (slot 1 sample)", "retinal_octa")
 
 print("\nDone. Any 'YBR*' PhotometricInterpretation values above need a colorspace")
 print("fix in the conversion script. If only iCare Eidon shows YBR, the fix is")
