@@ -1,0 +1,133 @@
+{
+ "run_date": "2026-10-12",
+ "script": "7. verification data script/stratified_sample_verification.py",
+ "dhis2_version": "2.44",
+ "registry_state": {
+  "tracked_entities": 2280,
+  "program_stages": 27,
+  "data_elements": 445,
+  "events": 8259470
+ },
+ "method": "stratified random sampling without replacement, allocation proportional to live event counts, target 2000 participants overall, independent seed per group derived from base seed 42; tolerance 0.01; an empty value on either side counts as a mismatch; events with no source hour and source hours with no event are counted separately",
+ "elapsed_seconds": 5435,
+ "results": {
+  "wearable": {
+   "values_compared": 1288628,
+   "matched": 1288628,
+   "mismatched": 0,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 0,
+   "match_rate_pct": 100.0,
+   "participants_sampled": 471,
+   "seed": 2368121044
+  },
+  "glucose": {
+   "values_compared": 369940,
+   "matched": 369795,
+   "mismatched": 145,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 145,
+   "match_rate_pct": 99.9608,
+   "participants_sampled": 160,
+   "seed": 345734204
+  },
+  "environmental": {
+   "values_compared": 12662360,
+   "matched": 12662305,
+   "mismatched": 55,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 55,
+   "match_rate_pct": 99.9996,
+   "participants_sampled": 1328,
+   "seed": 3202671363
+  },
+  "diagnosis": {
+   "values_compared": 72,
+   "matched": 72,
+   "mismatched": 0,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 0,
+   "match_rate_pct": 100.0,
+   "participants_sampled": 4,
+   "seed": 3288254405
+  },
+  "retinal_photography": {
+   "values_compared": 10872,
+   "matched": 10872,
+   "mismatched": 0,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 0,
+   "match_rate_pct": 100.0,
+   "participants_sampled": 29,
+   "seed": 1861712630
+  },
+  "retinal_octa": {
+   "values_compared": 8,
+   "matched": 8,
+   "mismatched": 0,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 0,
+   "match_rate_pct": 100.0,
+   "participants_sampled": 8,
+   "seed": 316989821
+  },
+  "ecg": {
+   "values_compared": 1,
+   "matched": 1,
+   "mismatched": 0,
+   "events_with_no_source_hour": 0,
+   "source_hours_with_no_event": 0,
+   "discrepancies": 0,
+   "match_rate_pct": 100.0,
+   "participants_sampled": 1,
+   "seed": 4282069731
+  }
+ },
+ "totals": {
+  "values_compared": 14331881,
+  "matched": 14331681,
+  "mismatched": 200,
+  "events_with_no_source_hour": 0,
+  "source_hours_with_no_event": 0,
+  "match_rate_pct": 99.9986
+ },
+ "mismatch_trace": {
+  "method": "every mismatch re-derived field by field for the sampled participants of the glucose and environmental groups; the script now records this itself in stratified_sample_mismatches.json",
+  "glucose": {
+   "total": 145,
+   "sd_of_single_reading_hour": 64,
+   "mean_min_max_of_hour_with_only_High_Low_markers": 81,
+   "hours_affected_by_marker_only_case": 27,
+   "participants_with_mismatch": 37,
+   "stored_value_differed_from_source": 0
+  },
+  "environmental": {
+   "total": 55,
+   "sd_of_single_reading_hour": 55,
+   "by_channel": {
+    "pm1": 7,
+    "pm2.5": 7,
+    "pm4": 7,
+    "pm10": 7,
+    "hum": 7,
+    "temp": 7,
+    "voc": 7,
+    "nox": 6
+   },
+   "participants_with_mismatch": 10,
+   "stored_value_differed_from_source": 0
+  },
+  "conclusion": "all 200 discrepancies are statistics undefined on both sides; no stored value differed from its source"
+ },
+ "prior_core_registry_result": {
+  "values": 82302,
+  "discrepancies": 0,
+  "method": "exhaustive, earlier project phase, separate script; reported separately, never merged"
+ }
+}

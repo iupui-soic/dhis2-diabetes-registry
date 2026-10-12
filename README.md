@@ -211,6 +211,36 @@ These are properties of the source data, verified against
 - **The dataset tree nests each modality one level deeper** than the manifest
   paths imply. `common.aireadi.resolve` handles both layouts.
 
+## Verification results
+
+The most recent run of `stratified_sample_verification.py` (12 October 2026,
+proportional allocation, target 2,000 participants) is recorded in
+`7. verification data script/results/`, as the checkpoint JSON and the run
+log. It compared 14,331,881 values across 2,001 participant draws, with
+zero events lacking a source hour and zero source hours lacking an event in
+every group. 200 values mismatched (99.9986% match). All 200 were traced:
+each is a statistic that is undefined on both sides, a standard deviation of
+an hour with one reading (64 glucose, 55 environmental) or the mean, minimum
+and maximum of a glucose hour containing only `High`/`Low` markers (81). The
+script counts an empty pair as a mismatch on purpose, so no stored value
+differed from its source. The script now writes every mismatch with its
+context to `stratified_sample_mismatches.json` and prints a breakdown by
+field and kind at the end of a run, so this trace no longer needs a separate
+script.
+
+| Group | Draws | Compared | Mismatched | Match % |
+| --- | ---: | ---: | ---: | ---: |
+| Wearable (HR, RR, SpO2, stress) | 471 | 1,288,628 | 0 | 100.0000 |
+| Glucose | 160 | 369,940 | 145 | 99.9608 |
+| Environment (8 channels) | 1,328 | 12,662,360 | 55 | 99.9996 |
+| Diagnosis | 4 | 72 | 0 | 100.0000 |
+| Retinal photography | 29 | 10,872 | 0 | 100.0000 |
+| Retinal OCTA (event counts) | 8 | 8 | 0 | 100.0000 |
+| ECG (event counts) | 1 | 1 | 0 | 100.0000 |
+
+The proportional allocation gives the small stages very few draws. Pass
+`--fixed-n` to set a floor if those groups are the question.
+
 ## Known limitations
 
 - **Demographic matching is ambiguous.** The six attributes
@@ -225,6 +255,17 @@ These are properties of the source data, verified against
 - **The 82,302-value core registry result is from an earlier phase.** The
   verification script reports it separately and never folds it into a measured
   match rate.
+
+## Publication
+
+A preliminary account of this registry and its mapping model was accepted as
+an abstract at the IEEE-EMBS International Conference on Biomedical and
+Health Informatics (BHI) 2026: A. N. Perumbilly, Z. Yin, S. Bucher and
+S. Purkayastha, "A Metadata-Driven ETL and Mapping Model for a Multimodal
+Diabetes Registry in DHIS2." The registry has grown since that abstract
+(27 stages and 445 data elements against the 23 and 152 reported there),
+and its verification figure came from the earlier sampling procedure that
+the audit replaced; the figures in this README supersede it.
 
 ## Security
 

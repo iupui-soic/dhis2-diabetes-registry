@@ -44,6 +44,13 @@ M-03  The hour lookup was a linear scan that re-parsed every source hour for
 M-11  Only rows[0] of each participant's manifest was used, ignoring a second
       wearable period or re-scan.
 
+Every mismatch is also written to stratified_sample_mismatches.json with its
+group, stage, participant, hour, field and both values, and the run ends with
+a breakdown by field and kind. In the 12 October 2026 run all 200 mismatches
+were statistics undefined on both sides (a standard deviation of a one-reading
+hour, or the mean/min/max of a glucose hour containing only High/Low markers);
+close_enough counts an empty pair as a mismatch on purpose.
+
 USAGE
 -----
     python3 "7. verification data script/stratified_sample_verification.py"
@@ -79,6 +86,7 @@ from env_aggregation_logic_v2 import (  # noqa: E402
 )
 
 CHECKPOINT_FILE = "stratified_sample_checkpoint.json"
+MISMATCH_FILE = "stratified_sample_mismatches.json"
 BASE_SEED = 42
 TOTAL_SAMPLE_TARGET = 2000
 
@@ -115,11 +123,16 @@ class Tally:
     real finding. It is counted here rather than dropped.
     """
 
-    def __init__(self):
+    def __init__(self, group=None):
+        self.group = group
         self.matched = 0
         self.mismatched = 0
         self.unmatched_events = 0
         self.unmatched_source = 0
+        # Every mismatch, with enough context to see why. Written to
+        # MISMATCH_FILE at the end of the run so that a discrepancy can be
+        # traced to its cause without re-running the aggregation.
+        self.mismatches = []
 
     @property
     def checked(self):
@@ -133,11 +146,16 @@ class Tally:
     def total_compared(self):
         return self.checked + self.unmatched_events + self.unmatched_source
 
-    def compare(self, dhis2_value, source_value):
+    def compare(self, dhis2_value, source_value, **context):
         if close_enough(dhis2_value, source_value):
             self.matched += 1
         else:
             self.mismatched += 1
+            self.mismatches.append({
+                "group": self.group, "dhis2": dhis2_value,
+                "source": None if source_value is None else str(source_value),
+                **context,
+            })
 
     def as_dict(self):
         rate = (100 * self.matched / self.total_compared) if self.total_compared else None
@@ -207,7 +225,7 @@ def index_by_hour(hourly):
     return {hour_key(k): v for k, v in hourly.items()}
 
 
-def compare_hourly(tally, events, source_hourly, field_uids):
+def compare_hourly(tally, events, source_hourly, field_uids, stage=None, pid=None):
     """Compare one stage's events against one aggregated source series."""
     indexed = index_by_hour(source_hourly)
     seen = set()
@@ -224,7 +242,9 @@ def compare_hourly(tally, events, source_hourly, field_uids):
             continue
         seen.add(key)
         for field, de_uid in field_uids.items():
-            tally.compare(event_value(event, de_uid), stats.get(field))
+            tally.compare(event_value(event, de_uid), stats.get(field),
+                          stage=stage, pid=pid, hour=occurred, field=field,
+                          source_count=stats.get("count"))
 
     # H-11: a source hour that produced no event is also a discrepancy.
     tally.unmatched_source += len(set(indexed) - seen)
@@ -237,7 +257,7 @@ def compare_hourly(tally, events, source_hourly, field_uids):
 def verify_wearable(session, registry, n, participants):
     manifest = aireadi.load_manifest("wearable_activity_monitor")
     shared = registry.wearable_shared_uids()
-    tally = Tally()
+    tally = Tally("wearable")
 
     for tei, pid in sample_participants("wearable", n, participants):
         rows = manifest.get(pid, [])
@@ -253,7 +273,8 @@ def verify_wearable(session, registry, n, participants):
             events = dhis2.fetch_events(
                 session, M.PROGRAM_UID, registry.stage(stage_name), tei
             )
-            compare_hourly(tally, events, aggregate_simple(readings), shared)
+            compare_hourly(tally, events, aggregate_simple(readings), shared,
+                           stage=stage_name, pid=pid)
     return tally
 
 
@@ -261,7 +282,7 @@ def verify_glucose(session, registry, n, participants):
     manifest = aireadi.load_manifest("wearable_blood_glucose")
     field_uids = {k: M.GLUCOSE_FIELD_UIDS[k] for k in GLUCOSE_COMPARED}
     stage_uid = registry.stage("CGM - Glucose")
-    tally = Tally()
+    tally = Tally("glucose")
 
     for tei, pid in sample_participants("glucose", n, participants):
         for row in manifest.get(pid, []):
@@ -269,7 +290,8 @@ def verify_glucose(session, registry, n, participants):
             if not path:
                 continue
             events = dhis2.fetch_events(session, M.PROGRAM_UID, stage_uid, tei)
-            compare_hourly(tally, events, aggregate_glucose(path), field_uids)
+            compare_hourly(tally, events, aggregate_glucose(path), field_uids,
+                           stage="CGM - Glucose", pid=pid)
     return tally
 
 
@@ -277,7 +299,7 @@ def verify_environmental(session, registry, n, participants):
     manifest = aireadi.load_manifest("environment")
     base = registry.env_field_uids()
     compared = {k: base[k] for k in ("mean", "min", "max", "sd", "count")}
-    tally = Tally()
+    tally = Tally("environmental")
 
     for tei, pid in sample_participants("environmental", n, participants):
         rows = []
@@ -293,7 +315,8 @@ def verify_environmental(session, registry, n, participants):
             events = dhis2.fetch_events(
                 session, M.PROGRAM_UID, registry.environment_stage(column), tei
             )
-            compare_hourly(tally, events, aggregate_env_column(rows, column), compared)
+            compare_hourly(tally, events, aggregate_env_column(rows, column), compared,
+                           stage=column, pid=pid)
     return tally
 
 
@@ -306,7 +329,7 @@ def verify_diagnosis(session, registry, n, participants):
     code_de = registry.data_element("Diagnosis Condition Code")
     label_de = registry.data_element("Diagnosis Condition Label")
     date_de = registry.data_element("Diagnosis Date")
-    tally = Tally()
+    tally = Tally("diagnosis")
 
     for tei, pid in sample_participants("diagnosis", n, participants):
         source_rows = by_person.get(pid)
@@ -330,9 +353,9 @@ def verify_diagnosis(session, registry, n, participants):
                 continue
             matched_codes.add(code)
             label, date = candidates[0]
-            tally.compare(code, code)
-            tally.compare(event_value(event, label_de), label)
-            tally.compare(event_value(event, date_de), date)
+            tally.compare(code, code, pid=pid, field="code")
+            tally.compare(event_value(event, label_de), label, pid=pid, field="label", code=code)
+            tally.compare(event_value(event, date_de), date, pid=pid, field="date", code=code)
         tally.unmatched_source += len(set(by_code) - matched_codes)
     return tally
 
@@ -347,7 +370,7 @@ def verify_retinal_photography(session, registry, n, participants):
     stage_uid = registry.stage("Retinal Photography")
     fields = M.RETINAL_PHOTOGRAPHY_FIELD_UIDS
     sop_de = fields["sop_instance_uid"]
-    tally = Tally()
+    tally = Tally("retinal_photography")
 
     for tei, pid in sample_participants("retinal_photography", n, participants):
         rows = by_person.get(pid, [])
@@ -367,7 +390,8 @@ def verify_retinal_photography(session, registry, n, participants):
                 tally.unmatched_source += 1
                 continue
             for column in RETINAL_PHOTOGRAPHY_COLUMNS:
-                tally.compare(event_value(event, fields[column]), row.get(column))
+                tally.compare(event_value(event, fields[column]), row.get(column),
+                              pid=pid, field=column, sop=row.get("sop_instance_uid"))
         tally.unmatched_events += len(set(by_sop) - {
             r.get("sop_instance_uid") for r in rows
         })
@@ -378,14 +402,14 @@ def verify_event_counts(session, registry, stage_name, modality, n, participants
     """Count reconciliation for stages without a traced field mapping."""
     manifest = aireadi.load_manifest(modality)
     stage_uid = registry.stage(stage_name)
-    tally = Tally()
+    tally = Tally(group)
 
     for tei, pid in sample_participants(group, n, participants):
         expected = len(manifest.get(pid, []))
         actual = len(dhis2.fetch_events(
             session, M.PROGRAM_UID, stage_uid, tei, fields="event"
         ))
-        tally.compare(actual, expected)
+        tally.compare(actual, expected, pid=pid, field="event_count")
     return tally
 
 
@@ -446,6 +470,43 @@ def plan_sample_sizes(session, registry, groups, target_total):
     return sizes, counts, []
 
 
+def record_mismatches(group, mismatches):
+    """Append one group's mismatches to MISMATCH_FILE, keyed by group.
+
+    The file holds the context of every mismatch (group, stage, participant,
+    hour, field, both values, the source hour's reading count) so that a
+    discrepancy can be classified, for instance as a statistic undefined on
+    both sides, without repeating the source aggregation.
+    """
+    existing = {}
+    if os.path.exists(MISMATCH_FILE):
+        with open(MISMATCH_FILE) as fh:
+            existing = json.load(fh)
+    existing[group] = mismatches
+    with open(MISMATCH_FILE, "w") as fh:
+        json.dump(existing, fh, indent=1)
+
+
+def summarise_mismatches():
+    """Print a breakdown of recorded mismatches by group, field and kind."""
+    if not os.path.exists(MISMATCH_FILE):
+        return
+    with open(MISMATCH_FILE) as fh:
+        recorded = json.load(fh)
+    print("\nMISMATCH BREAKDOWN (from %s)" % MISMATCH_FILE)
+    for group, items in recorded.items():
+        if not items:
+            continue
+        by_kind = {}
+        for m in items:
+            both_empty = m.get("dhis2") is None and m.get("source") is None
+            kind = "undefined on both sides" if both_empty else "values differ"
+            key = (m.get("field"), kind)
+            by_kind[key] = by_kind.get(key, 0) + 1
+        for (field, kind), n in sorted(by_kind.items()):
+            print(f"  {group:<22}{field or '-':<14}{kind:<26}{n:>8}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--fixed-n", type=int,
@@ -494,6 +555,8 @@ def main():
                           f"target {args.target_total} participants overall")
 
     checkpoint = {"results": {}}
+    if args.fresh and os.path.exists(MISMATCH_FILE):
+        os.remove(MISMATCH_FILE)
     if os.path.exists(CHECKPOINT_FILE) and not args.fresh:
         with open(CHECKPOINT_FILE) as fh:
             checkpoint = json.load(fh)
@@ -527,7 +590,10 @@ def main():
         checkpoint["results"][group] = result
         with open(CHECKPOINT_FILE, "w") as fh:
             json.dump(checkpoint, fh, indent=2)
+        record_mismatches(group, tally.mismatches)
         print(f"[done] {group}: {result}")
+        if tally.mismatches:
+            print(f"       {len(tally.mismatches)} mismatches written to {MISMATCH_FILE}")
 
     results = checkpoint["results"]
     compared = sum(r["values_compared"] for r in results.values())
@@ -553,6 +619,8 @@ def main():
     print(f"  Discrepancies:   {discrepancies}")
     if compared:
         print(f"  Match rate:      {100 * matched / compared:.4f}%")
+
+    summarise_mismatches()
 
     # H-12: reported next to the sampled result, never merged into it.
     print("\nPRIOR CORE REGISTRY RESULT, not re-verified by this run")

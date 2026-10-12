@@ -1,0 +1,57 @@
+Participants in the registry: 2280
+
+Counting live events per group for proportional allocation
+  wearable: 1525799 events
+  glucose: 519617 events
+  environmental: 4305422 events
+  diagnosis: 12375 events
+  retinal_photography: 93920 events
+  retinal_octa: 24560 events
+  ecg: 2258 events
+
+[run] wearable, n=471
+[done] wearable: {'values_compared': 1288628, 'matched': 1288628, 'mismatched': 0, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 0, 'match_rate_pct': 100.0, 'participants_sampled': 471, 'seed': 2368121044}
+
+[run] glucose, n=160
+[done] glucose: {'values_compared': 369940, 'matched': 369795, 'mismatched': 145, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 145, 'match_rate_pct': 99.9608, 'participants_sampled': 160, 'seed': 345734204}
+
+[run] environmental, n=1328
+[done] environmental: {'values_compared': 12662360, 'matched': 12662305, 'mismatched': 55, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 55, 'match_rate_pct': 99.9996, 'participants_sampled': 1328, 'seed': 3202671363}
+
+[run] diagnosis, n=4
+[done] diagnosis: {'values_compared': 72, 'matched': 72, 'mismatched': 0, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 0, 'match_rate_pct': 100.0, 'participants_sampled': 4, 'seed': 3288254405}
+
+[run] retinal_photography, n=29
+[done] retinal_photography: {'values_compared': 10872, 'matched': 10872, 'mismatched': 0, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 0, 'match_rate_pct': 100.0, 'participants_sampled': 29, 'seed': 1861712630}
+
+[run] retinal_octa, n=8
+[done] retinal_octa: {'values_compared': 8, 'matched': 8, 'mismatched': 0, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 0, 'match_rate_pct': 100.0, 'participants_sampled': 8, 'seed': 316989821}
+
+[run] ecg, n=1
+[done] ecg: {'values_compared': 1, 'matched': 1, 'mismatched': 0, 'events_with_no_source_hour': 0, 'source_hours_with_no_event': 0, 'discrepancies': 0, 'match_rate_pct': 100.0, 'participants_sampled': 1, 'seed': 4282069731}
+
+========================================================================
+SAMPLED VERIFICATION
+  method: stratified random sampling without replacement, proportional to live event counts, target 2000 participants overall,
+          independent seed per group derived from base seed 42
+  elapsed: 5435s
+
+  group                   compared   matched  mismatch  no source  no event     rate
+  wearable                 1288628   1288628         0          0         0  100.00%
+  glucose                   369940    369795       145          0         0   99.96%
+  environmental           12662360  12662305        55          0         0  100.00%
+  diagnosis                     72        72         0          0         0  100.00%
+  retinal_photography        10872     10872         0          0         0  100.00%
+  retinal_octa                   8         8         0          0         0  100.00%
+  ecg                            1         1         0          0         0  100.00%
+
+  Values compared: 14331881
+  Discrepancies:   200
+  Match rate:      99.9986%
+
+PRIOR CORE REGISTRY RESULT, not re-verified by this run
+  values: 82302
+  discrepancies: 0
+  method: exhaustive, all values, established in an earlier project phase
+  This figure comes from an earlier phase. Do not add it to the sampled totals above: doing so folds an assumed 100% into a measured rate.
+========================================================================

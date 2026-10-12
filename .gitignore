@@ -17,6 +17,7 @@ credentials.json
 # ---------------------------------------------------------------------------
 *_checkpoint.json
 *_checkpoint_*.json
+stratified_sample_mismatches.json
 *.pre-audit-backup
 stage_count_cache.json
 metadata_uid_cache.json
