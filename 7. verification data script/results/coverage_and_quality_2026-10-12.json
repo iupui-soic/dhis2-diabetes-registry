@@ -1,0 +1,183 @@
+{
+ "run_date": "2026-10-12",
+ "method": "read-only tracker queries; aggregate statistics only",
+ "data_sufficiency_by_stream": {
+  "Wearable - Heart Rate": {
+   "hourly_events": 485951,
+   "SUFFICIENT": 482899,
+   "LIMITED": 3052,
+   "NO_VALID_DATA": 0,
+   "SUFFICIENT_pct": 99.37,
+   "LIMITED_pct": 0.63,
+   "NO_VALID_DATA_pct": 0.0,
+   "unlabelled": 0
+  },
+  "Wearable - Respiratory Rate": {
+   "hourly_events": 487770,
+   "SUFFICIENT": 483362,
+   "LIMITED": 4408,
+   "NO_VALID_DATA": 0,
+   "SUFFICIENT_pct": 99.1,
+   "LIMITED_pct": 0.9,
+   "NO_VALID_DATA_pct": 0.0,
+   "unlabelled": 0
+  },
+  "Wearable - SpO2": {
+   "hourly_events": 73001,
+   "SUFFICIENT": 65311,
+   "LIMITED": 7690,
+   "NO_VALID_DATA": 0,
+   "SUFFICIENT_pct": 89.47,
+   "LIMITED_pct": 10.53,
+   "NO_VALID_DATA_pct": 0.0,
+   "unlabelled": 0
+  }
+ },
+ "cgm_sensor_wear_days": {
+  "n": 2245,
+  "min": 2.0,
+  "q1": 11.0,
+  "median": 11.0,
+  "q3": 11.0,
+  "max": 15.0,
+  "mean": 10.7,
+  "sd": 1.08,
+  "ge_7_days_pct": 98.26,
+  "ge_10_days_pct": 94.16
+ },
+ "activity_monitor_days": {
+  "n": 2154,
+  "min": 0.0,
+  "q1": 14.0,
+  "median": 15.0,
+  "q3": 18.0,
+  "max": 93.0,
+  "mean": 16.16,
+  "sd": 8.218,
+  "ge_7_days_pct": 94.52,
+  "ge_10_days_pct": 91.78
+ },
+ "environment_sensor_days": {
+  "n": 2154,
+  "min": 0.0,
+  "q1": 9.7,
+  "median": 10.5,
+  "q3": 11.0,
+  "max": 24.7,
+  "mean": 9.99,
+  "sd": 2.557,
+  "ge_7_days_pct": 91.55,
+  "ge_10_days_pct": 67.46
+ },
+ "hba1c_percent": {
+  "overall": {
+   "n": 2211,
+   "min": 3.8,
+   "q1": 5.5,
+   "median": 5.8,
+   "q3": 6.4,
+   "max": 17.0,
+   "mean": 6.12,
+   "sd": 1.105
+  },
+  "by_severity_group": {
+   "healthy": {
+    "n": 760,
+    "min": 4.2,
+    "q1": 5.3,
+    "median": 5.5,
+    "q3": 5.7,
+    "max": 13.9,
+    "mean": 5.54,
+    "sd": 0.51
+   },
+   "insulin_dependent": {
+    "n": 248,
+    "min": 3.8,
+    "q1": 6.3,
+    "median": 7.0,
+    "q3": 7.9,
+    "max": 17.0,
+    "mean": 7.38,
+    "sd": 1.733
+   },
+   "oral_medication_and_or_non_insulin_injectable_medication_controlled": {
+    "n": 657,
+    "min": 5.0,
+    "q1": 5.9,
+    "median": 6.3,
+    "q3": 6.9,
+    "max": 13.4,
+    "mean": 6.55,
+    "sd": 1.101
+   },
+   "pre_diabetes_lifestyle_controlled": {
+    "n": 546,
+    "min": 4.8,
+    "q1": 5.6,
+    "median": 5.8,
+    "q3": 6.0,
+    "max": 12.8,
+    "mean": 5.85,
+    "sd": 0.526
+   }
+  }
+ },
+ "cgm_hourly_coverage": {
+  "participants_with_cgm": 2245,
+  "distinct_days_with_data": {
+   "n": 2245,
+   "min": 2,
+   "q1": 11.0,
+   "median": 11,
+   "q3": 11.0,
+   "max": 15,
+   "mean": 10.7,
+   "sd": 1.08
+  },
+  "ge_7_days_pct": 98.26,
+  "ge_10_days_pct": 94.16,
+  "hourly_completeness_over_span_pct": {
+   "n": 2245,
+   "min": 10.416666666666666,
+   "q1": 90.15,
+   "median": 90.53,
+   "q3": 90.53,
+   "max": 100.0,
+   "mean": 89.77,
+   "sd": 5.615
+  },
+  "ge_70pct_complete_pct": 98.93
+ },
+ "heart_rate_hourly_coverage": {
+  "participants_with_hr": 1999,
+  "hours_with_data": {
+   "n": 1999,
+   "min": 1,
+   "q1": 235.0,
+   "median": 251,
+   "q3": 265.0,
+   "max": 938,
+   "mean": 243.1,
+   "sd": 55.261
+  },
+  "distinct_days_with_data": {
+   "n": 1999,
+   "min": 1,
+   "q1": 12.0,
+   "median": 12,
+   "q3": 13.0,
+   "max": 41,
+   "mean": 12.52,
+   "sd": 2.733
+  },
+  "ge_7_days_pct": 97.45
+ },
+ "burden_all_three_streams_ge_7_days": {
+  "participants": 1709,
+  "of": 2280,
+  "pct": 74.96,
+  "definition": ">= 7 distinct days with CGM hourly events, >= 7 with heart-rate hourly events, env_duration_days >= 7"
+ },
+ "elapsed_seconds": 349
+}
