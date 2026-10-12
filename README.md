@@ -113,7 +113,10 @@ python3 "6. retinal imaging and OCTA/retinal_step3_add_enface_path.py"
 python3 "6. retinal imaging and OCTA/retinal_step2_import.py" --person-id 1072
 python3 "6. retinal imaging and OCTA/retinal_step2_import_full.py" --all
 
-# 7. Verify
+# 7. Verify. Writes stratified_sample_checkpoint.json (per-group counts) and
+#    stratified_sample_mismatches.json (every mismatch with its stage,
+#    participant, hour, field and both values) next to the script, and
+#    prints a breakdown by field and kind at the end. --fresh clears both.
 python3 "7. verification data script/stratified_sample_verification.py"
 ```
 
@@ -159,6 +162,16 @@ on the SOP Instance UID for an image. Matched events keep the server's UID
 and are updated; unmatched ones are created under their derived UID. The
 reconciler also counts server events the source no longer accounts for and
 says so in the per-participant line.
+
+**Verification records every mismatch, not just the count.** `Tally.compare`
+in `stratified_sample_verification.py` appends each mismatch with its
+group, stage, participant, hour, field, both values and the source hour's
+reading count to `stratified_sample_mismatches.json`, and the run ends
+with a breakdown by field and kind (`values differ` versus `undefined on
+both sides`). A match rate on its own cannot be explained; the file is
+what lets a discrepancy be traced to its cause without re-running the
+source aggregation. It holds participant-level values, so it is
+gitignored; the counts go in `results/`.
 
 **Checkpoints record outcomes.** `common.checkpoint.Checkpoint` marks a
 participant done only after a confirmed write, and records failures so the
