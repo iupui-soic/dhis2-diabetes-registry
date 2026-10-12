@@ -241,6 +241,10 @@ script.
 The proportional allocation gives the small stages very few draws. Pass
 `--fixed-n` to set a floor if those groups are the question.
 
+`cohort_query_gradable_cgm.py`, re-run the same day, assembled 2,205 of the
+2,280 participants (gradable photography and at least seven CGM days) in
+184 s through the web interface; the result is in the same JSON file.
+
 ## Known limitations
 
 - **Demographic matching is ambiguous.** The six attributes

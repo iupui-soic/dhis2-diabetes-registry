@@ -129,5 +129,12 @@
   "values": 82302,
   "discrepancies": 0,
   "method": "exhaustive, earlier project phase, separate script; reported separately, never merged"
+ },
+ "cohort_query_2026-10-12": {
+  "script": "7. verification data script/cohort_query_gradable_cgm.py",
+  "criteria": "gradable retinal photography (non-empty preview) and >= 7 distinct days of CGM events",
+  "participants_checked": 2280,
+  "cohort_size": 2205,
+  "query_seconds": 184.2
  }
 }
