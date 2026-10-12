@@ -7,6 +7,12 @@ before importing.
 Credentials are not needed here: this step only reads the CSV and the UID
 lookup, and writes a file.
 
+Every tracked entity, enrollment and event carries a UID derived from the
+person_id (and stage), so send_to_dhis2.py can use CREATE_AND_UPDATE and a
+re-run updates the same records instead of creating a second participant.
+
+uid_lookup.json is produced by build_uid_lookup.py from the live server.
+
 NOTE ON DATES
 -------------
 registry_master_v3.csv carries no visit date, so every enrollment and event
@@ -24,7 +30,7 @@ import sys
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from common import registry_fields  # noqa: E402
+from common import dhis2, registry_fields  # noqa: E402
 
 ORG_UNIT_MAP = {
     "UAB": "jZmnwTrmXnR",
@@ -94,6 +100,7 @@ def build_tei(row, lookup, visit_dates):
                 data_values.append({"dataElement": uid, "value": value})
         if data_values:
             events.append({
+                "event": dhis2.generate_uid("core-event", person_id, stage_key),
                 "programStage": lookup["stage_uids"][stage_key],
                 "orgUnit": org_unit,
                 "occurredAt": occurred,
@@ -102,10 +109,12 @@ def build_tei(row, lookup, visit_dates):
             })
 
     return {
+        "trackedEntity": dhis2.generate_uid("core-tei", person_id),
         "trackedEntityType": lookup["tracked_entity_type_uid"],
         "orgUnit": org_unit,
         "attributes": attributes,
         "enrollments": [{
+            "enrollment": dhis2.generate_uid("core-enrollment", person_id),
             "orgUnit": org_unit,
             "program": lookup["program_uid"],
             "enrolledAt": occurred,

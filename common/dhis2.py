@@ -13,6 +13,7 @@ hand-rolling the same request again:
     before handing back UIDs, so a stage can never be built from None.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -31,6 +32,19 @@ DEFAULT_PAGE_SIZE = 500
 
 class Dhis2Error(RuntimeError):
     """Raised when DHIS2 reports a failure that the caller must not ignore."""
+
+
+# Object names on the server mix dash characters: "Wearable – Heart Rate" uses
+# an en dash, while "Cardiac – 12-Lead ECG" uses an en dash AND a hyphen in the
+# same name. Normalise every dash to one character on both sides before
+# comparing, rather than rewriting one into the other, which would also rewrite
+# the hyphen in "12-Lead".
+_DASHES = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+
+
+def normalise_name(name):
+    """Dash- and case-insensitive form of a metadata name, for comparisons."""
+    return " ".join("".join("-" if ch in _DASHES else ch for ch in str(name)).split()).casefold()
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +104,12 @@ def request(session, method, url, **kwargs):
 
     Never returns a response the caller has to re-check: anything at or above
     400 that is not retryable raises.
+
+    A retry after a 502/504 or a timeout re-sends a write the server may
+    already have committed. That is only safe because every import in this
+    repository now carries client-supplied UIDs and uses CREATE_AND_UPDATE,
+    so the second attempt updates rather than duplicates. Do not add a write
+    path that relies on this retry without deterministic UIDs.
     """
     kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
     last = None
@@ -135,44 +155,139 @@ def extract_items(payload, *candidate_keys):
 def fetch_all_pages(session, path, params, item_keys, page_size=DEFAULT_PAGE_SIZE):
     """Fetch every page of a collection endpoint.
 
-    Terminates on a short page as well as an empty one, so a server that
-    ignores `page` cannot spin this forever. Raises on any HTTP error rather
-    than returning [] and letting the caller mistake failure for emptiness.
+    Stops only on an EMPTY page. The previous version also stopped on a short
+    page, which silently lost rows whenever the server capped pageSize below
+    what was asked for. One extra request per fetch is the price of knowing
+    the collection is exhausted.
+
+    Tracker endpoints are given a stable sort order when the caller does not
+    supply one, so the server cannot reorder rows between pages and let the
+    same row appear twice while another never appears.
+
+    Raises on any HTTP error rather than returning [] and letting the caller
+    mistake failure for emptiness.
     """
     out = []
     page = 1
     while True:
         merged = dict(params or {})
+        if path.lstrip("/").startswith("tracker/") and "order" not in merged:
+            merged["order"] = "createdAt:asc"
         merged.update({"page": page, "pageSize": page_size})
         batch = extract_items(get_json(session, path, merged), *item_keys)
         if not batch:
             break
         out.extend(batch)
-        if len(batch) < page_size:
-            break
         page += 1
     return out
+
+
+# ---------------------------------------------------------------------------
+# Deterministic UIDs
+# ---------------------------------------------------------------------------
+
+_UID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def generate_uid(*parts):
+    """A valid DHIS2 UID (11 chars, letter first) derived from the parts.
+
+    The same parts always give the same UID, which is what makes a re-run
+    safe: a tracker CREATE_AND_UPDATE with a client-supplied UID updates the
+    row that is already there instead of creating a second one. Without this,
+    every retry after a proxy timeout, every resumed run, and every
+    --person-id re-run created duplicate events, because CREATE carries no
+    identity the server could match on.
+
+    Parts are joined with a separator that cannot appear in any of them, so
+    ("a", "bc") and ("ab", "c") do not collide.
+    """
+    key = "\x1f".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    first = _UID_ALPHABET[digest[0] % 52]  # letters only
+    rest = "".join(_UID_ALPHABET[b % 62] for b in digest[1:11])
+    return first + rest
+
+
+def assign_event_uids(events, key_fn):
+    """Give every event a deterministic UID from key_fn(event).
+
+    Two events with the same key (for example two identical sleep segments
+    in the source file) get distinct UIDs by sequence number, so nothing is
+    dropped and the result is still stable across runs as long as the source
+    order is. Mutates and returns the list.
+    """
+    seen = {}
+    for event in events:
+        key = tuple(key_fn(event))
+        n = seen.get(key, 0)
+        seen[key] = n + 1
+        event["event"] = generate_uid(*key, n)
+    return events
+
+
+def check_unique_uids(items, kind):
+    """Raise if any client-supplied UID appears twice in one payload."""
+    counts = {}
+    for item in items:
+        uid = item.get(kind)
+        if uid:
+            counts[uid] = counts.get(uid, 0) + 1
+    dupes = [u for u, c in counts.items() if c > 1]
+    if dupes:
+        raise Dhis2Error(
+            f"{len(dupes)} duplicate {kind} UID(s) in one payload, e.g. {dupes[:3]}. "
+            f"The server would reject or merge these, so refusing to send."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Tracker writes
 # ---------------------------------------------------------------------------
 
-def _stats_of(payload):
+TRACKER_TYPES = ("TRACKED_ENTITY", "ENROLLMENT", "EVENT", "RELATIONSHIP")
+
+
+def _stats_of(payload, tracker_type=None):
+    """Import stats, for one object type when asked.
+
+    The top-level stats on a tracker import report SUM every object type.
+    A payload of 100 tracked entities, each with an enrollment and three
+    events, reports created=500. Checking that against len(batch) made
+    send_to_dhis2.py mark every successful batch as failed. The per-type
+    numbers live in bundleReport.typeReportMap.<TYPE>.stats, which the
+    server only includes with reportMode=FULL.
+    """
+    if tracker_type:
+        type_map = (payload.get("bundleReport") or {}).get("typeReportMap") or {}
+        report = type_map.get(tracker_type)
+        if report and isinstance(report.get("stats"), dict):
+            stats = report["stats"]
+            return {k: stats.get(k, 0) for k in ("created", "updated", "deleted", "ignored")}
+        return None
     stats = payload.get("stats") or payload.get("response", {}).get("stats") or {}
     return {k: stats.get(k, 0) for k in ("created", "updated", "deleted", "ignored")}
 
 
-def import_tracker(session, payload, strategy, expect=None, expect_count=None):
+def import_tracker(session, payload, strategy, expect=None, expect_count=None,
+                   tracker_type=None):
     """POST to /api/tracker and verify the server actually accepted the work.
 
-    Returns the stats dict. Raises Dhis2Error when the import reported an
-    error status, ignored anything, or fell short of expect_count. Callers
-    must not record progress unless this returns.
+    expect is "created", "updated" or "upserted" (created + updated, for
+    CREATE_AND_UPDATE). tracker_type names which object type the expectation
+    is about: "TRACKED_ENTITY" for a participant payload, "EVENT" for events.
+    Without it the expectation is checked against the summed top-level stats,
+    which is only right when the payload holds a single object type with no
+    nested children.
+
+    Returns the stats dict for tracker_type (or the top-level one). Raises
+    Dhis2Error when the import reported an error status, ignored anything,
+    or fell short of expect_count. Callers must not record progress unless
+    this returns.
     """
     resp = request(
         session, "POST", f"{api_url()}/tracker",
-        params={"importStrategy": strategy, "async": "false"},
+        params={"importStrategy": strategy, "async": "false", "reportMode": "FULL"},
         json=payload,
     )
     try:
@@ -181,17 +296,29 @@ def import_tracker(session, payload, strategy, expect=None, expect_count=None):
         raise Dhis2Error(f"tracker import returned non-JSON: {resp.text[:500]}")
 
     status = result.get("status", "UNKNOWN")
-    stats = _stats_of(result)
+    total = _stats_of(result)
+    stats = _stats_of(result, tracker_type) if tracker_type else total
 
-    if status not in ("OK", "SUCCESS") or stats["ignored"]:
+    if status not in ("OK", "SUCCESS") or total["ignored"]:
         raise Dhis2Error(
-            f"tracker {strategy} reported status={status} stats={stats}\n"
+            f"tracker {strategy} reported status={status} stats={total}\n"
             f"{_first_conflicts(result)}"
         )
-    if expect and expect_count is not None and stats[expect] != expect_count:
-        raise Dhis2Error(
-            f"tracker {strategy} expected {expect}={expect_count} but got {stats}"
-        )
+
+    if stats is None:
+        # Server did not return a per-type breakdown. Do not fail a batch the
+        # server committed, but do not claim an exact count either.
+        print(f"  [warn] no per-type stats for {tracker_type} in the import "
+              f"report; verified status and ignored=0 only. totals={total}")
+        return total
+
+    if expect and expect_count is not None:
+        got = (stats["created"] + stats["updated"]) if expect == "upserted" else stats[expect]
+        if got != expect_count:
+            raise Dhis2Error(
+                f"tracker {strategy} expected {expect}={expect_count} "
+                f"for {tracker_type or 'all types'} but got {stats}"
+            )
     return stats
 
 
@@ -209,19 +336,37 @@ def _first_conflicts(result, limit=5):
     return "\n".join(msgs[:limit])
 
 
+def _expectation_for(strategy):
+    return {"CREATE": "created", "UPDATE": "updated",
+            "CREATE_AND_UPDATE": "upserted"}.get(strategy, "upserted")
+
+
 def send_events(session, events, strategy, batch_size=200, on_batch=None):
     """Send events in batches, verifying each one.
 
-    Returns the summed stats. Raises on the first batch the server refuses,
-    so a caller cannot checkpoint a participant whose data was rejected.
+    For CREATE_AND_UPDATE every event must carry a client-supplied "event"
+    UID (see assign_event_uids); that is the only thing that makes the
+    strategy idempotent. Returns the summed stats. Raises on the first batch
+    the server refuses, so a caller cannot checkpoint a participant whose
+    data was rejected.
     """
+    if strategy == "CREATE_AND_UPDATE":
+        missing = [e for e in events if not e.get("event")]
+        if missing:
+            raise Dhis2Error(
+                f"{len(missing)} event(s) have no client UID. CREATE_AND_UPDATE "
+                f"without one is just CREATE and duplicates on re-run. Use "
+                f"dhis2.assign_event_uids first."
+            )
+    check_unique_uids(events, "event")
+
     totals = {"created": 0, "updated": 0, "deleted": 0, "ignored": 0}
+    expect = _expectation_for(strategy)
     for i in range(0, len(events), batch_size):
         batch = events[i:i + batch_size]
-        expect = "created" if strategy == "CREATE" else "updated"
         stats = import_tracker(
             session, {"events": batch}, strategy,
-            expect=expect, expect_count=len(batch),
+            expect=expect, expect_count=len(batch), tracker_type="EVENT",
         )
         for k in totals:
             totals[k] += stats[k]
@@ -256,11 +401,18 @@ def post_metadata(session, payload):
     return result
 
 
-def lookup_by_name(session, resource, names):
-    """Resolve {name: uid} for a resource, one request per name.
+def lookup_by_name(session, resource, names, program_uid=None):
+    """Resolve {name: uid} for a resource.
 
-    Deliberately not a name:in:[a,b,c] filter: that breaks silently on any
-    name containing a comma and gives no way to tell which entry is missing.
+    Exact name:eq first, one request per name (not name:in:[a,b,c], which
+    breaks silently on a comma). Anything still unresolved is then matched
+    dash- and case-insensitively against the full list of names, because
+    this server holds "Cardiac – 12-Lead ECG" with an en dash while the
+    script that created it spells the hyphen. The exact match alone made
+    step 1 non-idempotent: every re-run created a second, empty stage.
+
+    A name that matches more than one object after normalisation raises,
+    since picking one would silently send data to the wrong stage.
     """
     found = {}
     for name in names:
@@ -268,8 +420,36 @@ def lookup_by_name(session, resource, names):
             session, resource,
             {"filter": f"name:eq:{name}", "fields": "id,name", "paging": "false"},
         ).get(resource, [])
+        if len(items) > 1:
+            raise Dhis2Error(
+                f"{len(items)} {resource} are named exactly '{name}': "
+                f"{[i['id'] for i in items]}. Delete the duplicate before continuing."
+            )
         if items:
             found[name] = items[0]["id"]
+
+    missing = [n for n in names if n not in found]
+    if not missing:
+        return found
+
+    params = {"fields": "id,name", "paging": "false"}
+    if program_uid and resource == "programStages":
+        params["filter"] = f"program.id:eq:{program_uid}"
+    everything = get_json(session, resource, params).get(resource, [])
+    by_key = {}
+    for item in everything:
+        by_key.setdefault(normalise_name(item["name"]), []).append(item)
+
+    for name in missing:
+        matches = by_key.get(normalise_name(name), [])
+        if len(matches) > 1:
+            raise Dhis2Error(
+                f"'{name}' matches {len(matches)} {resource} once dashes and case "
+                f"are ignored: {[(m['name'], m['id']) for m in matches]}. "
+                f"Delete the duplicate before continuing."
+            )
+        if matches:
+            found[name] = matches[0]["id"]
     return found
 
 
@@ -372,6 +552,9 @@ def create_option_set(session, name, options):
     return uid
 
 
+_REGISTRY_CACHE = {}
+
+
 def option_value(option_set_name, display_name):
     """The code to store for an option, as the server defines it.
 
@@ -379,12 +562,23 @@ def option_value(option_set_name, display_name):
     code is only correct if the option was created by the current version of
     these scripts. Falls back to the plain derivation when no cache exists,
     which is the fresh-install case.
+
+    The registry is loaded once per process. This used to re-read and
+    re-parse the cache file on every call, which is once per event.
     """
     from common import metadata_uids
 
+    if "registry" not in _REGISTRY_CACHE:
+        try:
+            _REGISTRY_CACHE["registry"] = metadata_uids.load()
+        except (KeyError, OSError, SystemExit):
+            _REGISTRY_CACHE["registry"] = None
+    registry = _REGISTRY_CACHE["registry"]
+    if registry is None:
+        return option_code(display_name)
     try:
-        return metadata_uids.load().option_value(option_set_name, display_name)
-    except (KeyError, OSError, SystemExit):
+        return registry.option_value(option_set_name, display_name)
+    except KeyError:
         return option_code(display_name)
 
 
@@ -428,7 +622,7 @@ def attach_data_elements(session, stage_uid, de_uids):
 
 def create_program_stage(session, name, program_uid, de_uids, repeatable=True):
     """Create a program stage idempotently, refusing null data element UIDs."""
-    existing = lookup_by_name(session, "programStages", [name])
+    existing = lookup_by_name(session, "programStages", [name], program_uid=program_uid)
     if existing.get(name):
         attach_data_elements(session, existing[name], de_uids)
         return existing[name]
@@ -449,7 +643,7 @@ def create_program_stage(session, name, program_uid, de_uids, repeatable=True):
         ],
     }]})
 
-    resolved = lookup_by_name(session, "programStages", [name])
+    resolved = lookup_by_name(session, "programStages", [name], program_uid=program_uid)
     return require_all(resolved, [name], "program stages")[name]
 
 
@@ -469,6 +663,15 @@ def get_tei_context(session, program_uid, person_id_attr, person_id):
     )
     if not items:
         return None
+    if len(items) > 1:
+        # Two participants with one person_id. Attaching to whichever the
+        # server listed first would split a participant's data across two
+        # records, which is worse than stopping.
+        raise Dhis2Error(
+            f"{len(items)} tracked entities carry person_id={person_id}: "
+            f"{[t['trackedEntity'] for t in items]}. Merge or delete the "
+            f"duplicate before importing anything for this participant."
+        )
     tei = items[0]
     enrollments = tei.get("enrollments") or []
     active = next((e for e in enrollments if e.get("status") == "ACTIVE"), None)
@@ -497,17 +700,19 @@ def fetch_events(session, program_uid, stage_uid, tei_uid=None, fields=EVENT_FIE
 def merge_data_values(event, updates):
     """Build the full dataValues list for an event update.
 
-    A tracker UPDATE treats the submitted event as authoritative, so every
-    value the event should keep has to be present in the payload. Sending
-    only the changed value is what allowed the August 2026 retinal backfill
-    to strip 42,054 events.
+    Every value the event should keep is carried, so this is correct whether
+    the server replaces the set on UPDATE or merges it. DHIS2 2.44 was
+    verified to merge, which has a consequence for deletion: OMITTING an
+    element does not clear it. The only way to remove a value is to send the
+    element with an empty value, which is what None does here.
 
-    updates: {dataElement uid: value}. A value of None removes that element.
+    updates: {dataElement uid: value}. A value of None clears that element.
     """
     merged = {dv["dataElement"]: dv.get("value") for dv in event.get("dataValues", [])}
     for uid, value in updates.items():
         if value is None:
-            merged.pop(uid, None)
+            if uid in merged:
+                merged[uid] = ""
         else:
             merged[uid] = str(value)
     return [{"dataElement": k, "value": v} for k, v in merged.items() if v is not None]
@@ -519,7 +724,7 @@ def event_update_payload(event, stage_uid, program_uid, data_values):
     DHIS2 rejects an update that omits any of program, programStage, orgUnit,
     enrollment, occurredAt or status, even when only one value is changing.
     """
-    return {
+    payload = {
         "event": event["event"],
         "program": program_uid,
         "programStage": stage_uid,
@@ -529,6 +734,9 @@ def event_update_payload(event, stage_uid, program_uid, data_values):
         "status": event.get("status", "COMPLETED"),
         "dataValues": data_values,
     }
+    if event.get("trackedEntity"):
+        payload["trackedEntity"] = event["trackedEntity"]
+    return payload
 
 
 def data_value(uid, value):

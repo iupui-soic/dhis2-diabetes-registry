@@ -16,6 +16,17 @@ WHAT THE AUDIT FOUND (C-01, H-05, H-06, H-09), and what changed
    systematic bug looked identical to a missing file. Failures are now
    attributed to the participant and re-tried on the next run.
 
+4. Events carried no UID and were sent with CREATE, so any re-run, resumed
+   run or retried request duplicated them. Every event now has a UID derived
+   from person, stage and hour and is sent with CREATE_AND_UPDATE.
+
+5. Only the first manifest row per participant was read, which dropped the
+   second wearable period for anyone who has one. Every row is read.
+
+6. A participant with no tracked entity was checkpointed as done, so fixing
+   the core registry later never picked them up. They are now recorded as
+   skipped and retried on every run.
+
 USAGE
 -----
     nohup python3 "2. wearable script/hourly_step2_final.py" > hourly_import.log 2>&1 &
@@ -104,53 +115,57 @@ def make_event(config, stage_name, context, occurred_at, values):
     }
 
 
-def build_events(config, context, wam_row, bg_row):
-    """Build every event for one participant.
+def build_events(config, context, person_id, wam_rows, bg_rows):
+    """Build every event for one participant, across every manifest row.
 
     Raises on a genuine failure rather than swallowing it, so the caller can
     record the participant as failed instead of complete.
     """
     events = []
 
-    for stage_name, column, extractor in CONTINUOUS:
-        path = aireadi.resolve("wearable_activity_monitor", wam_row.get(column))
-        if not path:
-            continue
-        for hour, stats in aggregate_simple(extractor(path)).items():
-            event = make_event(config, stage_name, context, hour, stats)
-            if event:
-                events.append(event)
+    def add(stage_name, occurred_at, values):
+        event = make_event(config, stage_name, context, occurred_at, values)
+        if event:
+            events.append(event)
 
-    path = aireadi.resolve("wearable_activity_monitor", wam_row.get("sleep_filepath"))
-    if path:
-        for start_ts, sleep_stage, duration in extract_sleep_segments(path):
-            event = make_event(config, "Wearable - Sleep", context, start_ts,
-                               {"stage": sleep_stage, "duration_minutes": duration})
-            if event:
-                events.append(event)
+    for wam_row in wam_rows:
+        for stage_name, column, extractor in CONTINUOUS:
+            path = aireadi.resolve("wearable_activity_monitor", wam_row.get(column))
+            if not path:
+                continue
+            for hour, stats in aggregate_simple(extractor(path)).items():
+                add(stage_name, hour, stats)
 
-    path = aireadi.resolve("wearable_activity_monitor", wam_row.get("physical_activity_filepath"))
-    if path:
-        for hour, stats in aggregate_activity(path).items():
-            event = make_event(config, "Wearable - Activity", context, hour, stats)
-            if event:
-                events.append(event)
+        path = aireadi.resolve("wearable_activity_monitor", wam_row.get("sleep_filepath"))
+        if path:
+            for start_ts, sleep_stage, duration in extract_sleep_segments(path):
+                add("Wearable - Sleep", start_ts,
+                    {"stage": sleep_stage, "duration_minutes": duration})
 
-    path = aireadi.resolve("wearable_activity_monitor", wam_row.get("active_calories_filepath"))
-    if path:
-        for hour, stats in aggregate_calories(path).items():
-            event = make_event(config, "Wearable - Calories", context, hour, stats)
-            if event:
-                events.append(event)
+        path = aireadi.resolve("wearable_activity_monitor",
+                               wam_row.get("physical_activity_filepath"))
+        if path:
+            for hour, stats in aggregate_activity(path).items():
+                add("Wearable - Activity", hour, stats)
 
-    path = aireadi.resolve("wearable_blood_glucose", bg_row.get("glucose_filepath"))
-    if path:
-        for hour, stats in aggregate_glucose(path).items():
-            event = make_event(config, "CGM - Glucose", context, hour, stats)
-            if event:
-                events.append(event)
+        path = aireadi.resolve("wearable_activity_monitor",
+                               wam_row.get("active_calories_filepath"))
+        if path:
+            for hour, stats in aggregate_calories(path).items():
+                add("Wearable - Calories", hour, stats)
 
-    return events
+    for bg_row in bg_rows:
+        path = aireadi.resolve("wearable_blood_glucose", bg_row.get("glucose_filepath"))
+        if path:
+            for hour, stats in aggregate_glucose(path).items():
+                add("CGM - Glucose", hour, stats)
+
+    # Identity = participant + stage + instant. Two source rows that produce
+    # the same hour for the same stage (an overlapping second wearable period)
+    # get distinct UIDs by sequence, so neither is silently lost.
+    return dhis2.assign_event_uids(
+        events, lambda e: (person_id, e["programStage"], e["occurredAt"])
+    )
 
 
 def main():
@@ -163,8 +178,8 @@ def main():
     registry = M.load(session)
     config = stage_config(registry)
 
-    wam = aireadi.load_manifest_first("wearable_activity_monitor")
-    bg = aireadi.load_manifest_first("wearable_blood_glucose")
+    wam = aireadi.load_manifest("wearable_activity_monitor")
+    bg = aireadi.load_manifest("wearable_blood_glucose")
     all_ids = sorted(set(wam) | set(bg))
 
     with Checkpoint(CHECKPOINT_FILE, flush_every=5) as checkpoint:
@@ -185,15 +200,16 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    checkpoint.mark_skipped(person_id, "no tracked entity")
                     print(f"[{index}/{len(remaining)}] {person_id}: no TEI, skipped")
                     continue
 
                 events = build_events(
-                    config, context, wam.get(person_id, {}), bg.get(person_id, {})
+                    config, context, person_id, wam.get(person_id, []), bg.get(person_id, [])
                 )
                 if events:
-                    dhis2.send_events(session, events, "CREATE", batch_size=BATCH_SIZE)
+                    dhis2.send_events(session, events, "CREATE_AND_UPDATE",
+                                      batch_size=BATCH_SIZE)
                 checkpoint.mark_done(person_id)
                 print(f"[{index}/{len(remaining)}] {person_id}: {len(events)} events, "
                       f"{time.time() - t0:.1f}s (total {(time.time() - start) / 3600:.2f}h)")

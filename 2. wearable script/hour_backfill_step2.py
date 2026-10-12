@@ -81,8 +81,8 @@ def main():
     hour_start_de = registry.data_element("Hour Start")
     hour_end_de = registry.data_element("Hour End")
 
-    wam = aireadi.load_manifest_first("wearable_activity_monitor")
-    bg = aireadi.load_manifest_first("wearable_blood_glucose")
+    wam = aireadi.load_manifest("wearable_activity_monitor")
+    bg = aireadi.load_manifest("wearable_blood_glucose")
     all_ids = sorted(set(wam) | set(bg))
 
     with Checkpoint(CHECKPOINT_FILE, flush_every=5) as checkpoint:
@@ -99,7 +99,7 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    checkpoint.mark_skipped(person_id, "no tracked entity")
                     continue
 
                 updated = 0

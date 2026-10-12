@@ -27,6 +27,8 @@ import_errors.json
 *.log
 *_affected_patients.csv
 corrupted_file_patients.csv
+all_registry_stage_uids.json
+stage_value_counts_checkpoint.json
 
 # ---------------------------------------------------------------------------
 # Study data. The AI-READI dataset is access-controlled and must never be

@@ -21,6 +21,12 @@ WHAT THE AUDIT FOUND (C-04), and what changed
 3. The participant fetch used a hardcoded pageSize of 2,280 with no paging
    and no error check, so a short read looked like a clean run. It now pages.
 
+4. The update payload carried only trackedEntity and the one attribute. The
+   tracker importer requires orgUnit and trackedEntityType on an update
+   (E1121 / E1005) and rejected every batch. Both are now fetched and sent,
+   along with the entity's existing attributes so none is dropped on a
+   server that replaces rather than merges.
+
 USAGE
 -----
     python3 "1. core registry/add_person_id.py" --csv registry_master_v3.csv --dry-run
@@ -68,7 +74,9 @@ def build_csv_index(df):
 def fetch_entities(session):
     return dhis2.fetch_all_pages(
         session, "tracker/trackedEntities",
-        {"program": PROGRAM_UID, "fields": "trackedEntity,attributes[displayName,value]"},
+        {"program": PROGRAM_UID,
+         "fields": "trackedEntity,trackedEntityType,orgUnit,"
+                   "attributes[attribute,displayName,value]"},
         ("trackedEntities", "instances"),
     )
 
@@ -100,9 +108,17 @@ def main():
         attrs = {a["displayName"]: a["value"] for a in entity.get("attributes", [])}
         key = registry_fields.dhis2_key(attrs, DHIS2_KEY_ATTRIBUTES)
         if key in unique:
+            kept = [
+                {"attribute": a["attribute"], "value": a["value"]}
+                for a in entity.get("attributes", [])
+                if a.get("attribute") and a.get("attribute") != PERSON_ID_ATTR_UID
+                and a.get("value") not in (None, "")
+            ]
             updates.append({
                 "trackedEntity": entity["trackedEntity"],
-                "attributes": [
+                "trackedEntityType": entity["trackedEntityType"],
+                "orgUnit": entity["orgUnit"],
+                "attributes": kept + [
                     {"attribute": PERSON_ID_ATTR_UID, "value": str(unique[key])}
                 ],
             })
@@ -139,6 +155,7 @@ def main():
         stats = dhis2.import_tracker(
             session, {"trackedEntities": batch}, "UPDATE",
             expect="updated", expect_count=len(batch),
+            tracker_type="TRACKED_ENTITY",
         )
         written += stats["updated"]
         print(f"  batch {i // BATCH + 1}: updated={stats['updated']}")

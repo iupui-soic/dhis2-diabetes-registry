@@ -23,6 +23,11 @@ WHAT THE AUDIT FOUND (C-01, H-01, H-04, H-05, H-06), and what changed
 4. A tracker UPDATE replaces an event's data values, so every update now
    carries the event's existing values merged with the new ones.
 
+5. The --max-unmatched guard ran after the updates had already been sent,
+   so a participant with misaligned hour keys was written to and then
+   reported as "not marked complete". All three metrics are now built
+   first, the guard runs, and only then is anything sent.
+
 USAGE
 -----
     nohup python3 "2. wearable script/threshold_step2_backfill.py" > threshold.log 2>&1 &
@@ -210,10 +215,10 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    checkpoint.mark_skipped(person_id, "no tracked entity")
                     continue
 
-                total_updated, total_unmatched, total_events = 0, 0, 0
+                pending_updates, total_unmatched, total_events = [], 0, 0
                 for metric in METRICS:
                     updates, unmatched = build_updates(
                         session, registry, metric,
@@ -221,17 +226,22 @@ def main():
                     )
                     total_unmatched += unmatched
                     total_events += len(updates) + unmatched
-                    if updates:
-                        dhis2.send_events(session, updates, "UPDATE")
-                        total_updated += len(updates)
+                    pending_updates.extend(updates)
 
+                # Decide before writing. Sending first and raising afterwards
+                # would leave a half-written participant behind.
                 if total_events and total_unmatched / total_events > args.max_unmatched:
                     raise dhis2.Dhis2Error(
                         f"{total_unmatched} of {total_events} events had no matching "
                         f"source hour. That is above --max-unmatched, which usually "
                         f"means the hour keys are misaligned rather than that data is "
-                        f"genuinely missing. Not marking this participant complete."
+                        f"genuinely missing. Nothing written for this participant."
                     )
+
+                total_updated = 0
+                if pending_updates:
+                    dhis2.send_events(session, pending_updates, "UPDATE")
+                    total_updated = len(pending_updates)
 
                 checkpoint.mark_done(person_id)
                 print(f"[{index}/{len(remaining)}] {person_id}: {total_updated} updated, "

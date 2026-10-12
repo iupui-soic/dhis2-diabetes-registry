@@ -142,7 +142,7 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    checkpoint.mark_skipped(person_id, "no tracked entity")
                     continue
 
                 updates, unmatched = build_updates(

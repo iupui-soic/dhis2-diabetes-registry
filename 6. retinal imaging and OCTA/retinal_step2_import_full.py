@@ -28,6 +28,15 @@ M-01  Both manifests were re-read and re-parsed inside the per-participant
 M-02  save_checkpoint rewrote a 10.4 MB file after every one of 118,480
       events. Writes are now batched and atomic.
 
+      A preview that failed to convert or upload used to be printed, the
+      event created without it, and the row checkpointed as done, so only
+      the two failure modes the backfill knows about were ever retried.
+      The event is still created (its metadata is correct), but the row is
+      recorded as failed and the participant is not marked done, so the next
+      run retries the preview. Because every event now carries a UID derived
+      from its SOP Instance UID and is sent with CREATE_AND_UPDATE, that
+      retry updates the event in place instead of creating a second one.
+
 USAGE
 -----
     python3 ".../retinal_step2_import_full.py" --person-id 1072    # pilot
@@ -132,12 +141,13 @@ def upload_preview(session, modality, relative_path):
     return uid, None
 
 
-def build_event(stage_uid, context, occurred_at, values):
+def build_event(stage_uid, context, occurred_at, values, identity):
     data_values = [
         dv for dv in (dhis2.data_value(uid, value) for uid, value in values)
         if dv is not None
     ]
     return {
+        "event": dhis2.generate_uid("retinal", stage_uid, identity),
         "program": M.PROGRAM_UID,
         "programStage": stage_uid,
         "trackedEntity": context["trackedEntity"],
@@ -151,9 +161,10 @@ def build_event(stage_uid, context, occurred_at, values):
 
 def import_photography(session, fields, stage_uid, context, rows,
                        occurred_at, checkpoint):
-    created = 0
+    created, failed = 0, 0
     for row in rows:
-        key = f"photography::{row.get('sop_instance_uid')}"
+        identity = row.get("sop_instance_uid")
+        key = f"photography::{identity}"
         if checkpoint.is_done(key):
             continue
 
@@ -161,7 +172,7 @@ def import_photography(session, fields, stage_uid, context, rows,
             session, "retinal_photography", row.get("filepath")
         )
         if reason:
-            print(f"    {reason}")
+            print(f"    {key}: {reason}")
 
         event = build_event(stage_uid, context, occurred_at, [
             (fields["manufacturer"], row.get("manufacturer")),
@@ -175,17 +186,24 @@ def import_photography(session, fields, stage_uid, context, rows,
             (fields["sop_instance_uid"], row.get("sop_instance_uid")),
             (fields["filepath"], row.get("filepath")),
             (fields["preview"], preview_uid),
-        ])
-        dhis2.send_events(session, [event], "CREATE")
-        checkpoint.mark_done(key)
+        ], identity)
+        dhis2.send_events(session, [event], "CREATE_AND_UPDATE")
+        if reason:
+            # Metadata is on the server; the preview is not. Leave the row
+            # open so the next run rebuilds the preview onto the same event.
+            checkpoint.mark_failed(key, reason)
+            failed += 1
+        else:
+            checkpoint.mark_done(key)
         created += 1
-    return created
+    return created, failed
 
 
 def import_octa(session, fields, stage_uid, context, rows, occurred_at, checkpoint):
-    created = 0
+    created, failed = 0, 0
     for row in rows:
-        key = f"octa::{row.get('flow_cube_sop_instance_uid')}"
+        identity = row.get("flow_cube_sop_instance_uid")
+        key = f"octa::{identity}"
         if checkpoint.is_done(key):
             continue
 
@@ -193,7 +211,7 @@ def import_octa(session, fields, stage_uid, context, rows, occurred_at, checkpoi
         enface_path = row.get(f"associated_enface_{slot}_file_path")
         preview_uid, reason = upload_preview(session, "retinal_octa", enface_path)
         if reason:
-            print(f"    {reason}")
+            print(f"    {key}: {reason}")
 
         values = [
             (fields["manufacturer"], row.get("manufacturer")),
@@ -219,11 +237,17 @@ def import_octa(session, fields, stage_uid, context, rows, occurred_at, checkpoi
         if fields.get("enface_file_path"):
             values.append((fields["enface_file_path"], enface_path))
 
-        dhis2.send_events(session, [build_event(stage_uid, context, occurred_at, values)],
-                          "CREATE")
-        checkpoint.mark_done(key)
+        dhis2.send_events(
+            session, [build_event(stage_uid, context, occurred_at, values, identity)],
+            "CREATE_AND_UPDATE",
+        )
+        if reason:
+            checkpoint.mark_failed(key, reason)
+            failed += 1
+        else:
+            checkpoint.mark_done(key)
         created += 1
-    return created
+    return created, failed
 
 
 def main():
@@ -286,15 +310,22 @@ def main():
                 continue
 
             try:
-                created = import_photography(
+                created, failed = import_photography(
                     session, photo_fields, photo_stage, entry,
                     photo_rows.get(person_id, []), occurred_at, checkpoint,
                 )
-                created += import_octa(
+                octa_created, octa_failed = import_octa(
                     session, octa_fields, octa_stage, entry,
                     octa_rows.get(person_id, []), occurred_at, checkpoint,
                 )
-                checkpoint.mark_done(person_id)
+                created += octa_created
+                failed += octa_failed
+                if failed:
+                    checkpoint.mark_failed(
+                        person_id, f"{failed} preview(s) missing; see per-row entries"
+                    )
+                else:
+                    checkpoint.mark_done(person_id)
             except Exception as exc:
                 checkpoint.mark_failed(person_id, exc)
                 print(f"[{index}/{len(roster)}] {person_id}: FAILED, {str(exc)[:300]}")

@@ -20,6 +20,11 @@ value goes through the shared null and NaN guard.
 
 H-05: the participant was checkpointed complete regardless of the outcome.
 
+Events now carry a UID derived from participant, code, label and date and go
+out with CREATE_AND_UPDATE, so a re-run updates rather than duplicates. Two
+identical source rows still produce two events, by sequence number. A
+participant with no tracked entity is recorded as skipped, not done.
+
 USAGE
 -----
     python3 "5. diagnosis/diagnosis_step2_import.py"
@@ -108,7 +113,13 @@ def build_events(field_uids, stage_uid, context, rows):
             "occurredAt": date,
             "status": "COMPLETED",
             "dataValues": data_values,
+            "_key": (code, label, date),
         })
+    dhis2.assign_event_uids(
+        events, lambda e: ("diagnosis", e["trackedEntity"], e["programStage"]) + e["_key"]
+    )
+    for event in events:
+        del event["_key"]
     return events, skipped
 
 
@@ -146,10 +157,10 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(
+                    checkpoint.mark_skipped(
                         person_id,
-                        note="no tracked entity; this OMOP person_id may not match "
-                             "the registry person_id scheme",
+                        "no tracked entity; this OMOP person_id may not match "
+                        "the registry person_id scheme",
                     )
                     continue
 
@@ -160,7 +171,8 @@ def main():
                     skipped_total[reason] = skipped_total.get(reason, 0) + count
 
                 if events:
-                    dhis2.send_events(session, events, "CREATE", batch_size=BATCH_SIZE)
+                    dhis2.send_events(session, events, "CREATE_AND_UPDATE",
+                                      batch_size=BATCH_SIZE)
                 checkpoint.mark_done(person_id)
 
             except Exception as exc:

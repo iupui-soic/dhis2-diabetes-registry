@@ -19,21 +19,26 @@ Sources:
     built instead by scanning the manifest for the affected manufacturers.
 
 USAGE:
-    python3 identify_affected_patients.py
-    (run from the same folder as retinal_full_import.log and the AI-READI
-    manifests -- adjust paths below if needed)
+    python3 identify_affected_patients.py --log retinal_full_import.log
+
+The manifest is located through AIREADI_ROOT like every other script, rather
+than a path hardcoded to one person's home directory. The three CSVs this
+writes list participants by person_id and are gitignored.
 """
 
+import argparse
 import os
 import re
 import csv
+import sys
 from collections import defaultdict
 
 import pandas as pd
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import aireadi  # noqa: E402
+
 LOG_FILE = "retinal_full_import.log"
-AI_READI_ROOT = os.path.expanduser("~/AI-READI-fixed")
-PHOTOGRAPHY_MANIFEST = os.path.join(AI_READI_ROOT, "retinal_photography", "manifest.tsv")
 
 # Manufacturers confirmed via survey_color_encoding.py to use YBR_FULL_422
 YBR_AFFECTED_MANUFACTURERS = {"Optomed", "iCare"}
@@ -98,8 +103,12 @@ def write_csv(filename, rows, fieldnames):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--log", default=LOG_FILE, help="import log to parse")
+    args, _ = parser.parse_known_args()
+
     print("=== Parsing import log for Heidelberg and corrupted-file errors ===")
-    heidelberg_hits, corrupted_hits, other_errors = parse_log_for_errors(LOG_FILE)
+    heidelberg_hits, corrupted_hits, other_errors = parse_log_for_errors(args.log)
 
     print(f"\nHeidelberg (missing preview, pylibjpeg gap): "
           f"{len(heidelberg_hits)} patients, "
@@ -129,7 +138,7 @@ def main():
             print(f"    person_id={pid}: {errs[0][1][:100]}")
 
     print("\n=== Scanning manifest for YBR-affected patients (Optomed + iCare Eidon) ===")
-    ybr_counts = find_ybr_affected_patients(PHOTOGRAPHY_MANIFEST)
+    ybr_counts = find_ybr_affected_patients(aireadi.manifest_path("retinal_photography"))
     print(f"\nYBR color-cast affected: {len(ybr_counts)} patients, "
           f"{sum(ybr_counts.values())} files")
     write_csv(

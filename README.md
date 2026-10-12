@@ -16,14 +16,22 @@ or a shell command that gets committed.
 ```bash
 cp .env.example .env      # .env is gitignored
 $EDITOR .env
-set -a && . ./.env && set +a
 pip install -r requirements.txt
+nbstripout --install --attributes .gitattributes   # once per clone
 ```
+
+The scripts read `.env` themselves. Do not source it with `set -a && . ./.env`:
+the shell mangles any password containing `&` or `$`, and the variable arrives
+empty, which looks exactly like a missing credential.
 
 `.env` needs a DHIS2 URL, a write account for the metadata and import steps,
 optionally a read-only auditor account for the verification scripts, and the
 dataset root. On the JupyterHub server the dataset is at
 `/data0/AI-READI/full_subset`.
+
+`nbstripout` installs a git filter that drops notebook outputs on commit.
+Notebook outputs in this repository have held participant rows before, and
+`.gitignore` cannot catch those.
 
 ## Layout
 
@@ -44,12 +52,21 @@ them. See below for the run order.
 ## Run order
 
 Every modality is two steps: create the metadata, then import the data. Step 1
-is idempotent, so re-running it is safe. Step 2 is checkpointed and resumable.
+is idempotent, so re-running it is safe. Step 2 is checkpointed and resumable,
+and every event it creates carries a UID derived from its source identity
+(participant, stage and hour, or SOP Instance UID), sent with
+CREATE_AND_UPDATE. Re-running a step, resuming after a kill, or retrying after
+a proxy timeout therefore updates the same events rather than duplicating them.
 
 ```bash
 # 0. Core registry. Do this first: everything else attaches to these entities.
+#    The program, its attributes and its three core stages were built in the
+#    Maintenance app and are not created by any script. build_uid_lookup.py
+#    resolves their UIDs by name; --inventory shows what the server has if a
+#    name does not match.
+python3 "1. core registry/build_uid_lookup.py"      # writes uid_lookup.json
 python3 "1. core registry/import_data.py"           # writes import_payload.json
-python3 "1. core registry/send_to_dhis2.py"         # posts it
+python3 "1. core registry/send_to_dhis2.py"         # posts it, skipping person_ids already on the server
 
 # 1. Cache the metadata UIDs. Re-run after any step-1 script.
 python3 -m common.metadata_uids --refresh
@@ -96,6 +113,9 @@ tail -f hourly.log
 
 Each one writes a checkpoint next to itself. Stopping and re-running picks up
 where it left off, and only participants that actually succeeded are skipped.
+A participant with no tracked entity yet is recorded as *skipped*, not done,
+so once the core registry has them the next run imports their data.
+Checkpoints written by the pre-refactor scripts are read as well.
 
 ## Conventions
 
@@ -108,17 +128,31 @@ recorded and looks up the rest from the server, caching to
 pasted in by hand.
 
 **Writes are checked.** `common.dhis2.send_events` and `import_tracker` raise
-unless the server confirms the expected number of created or updated records.
-Nothing is marked complete on the strength of having been sent.
+unless the server confirms the expected number of created or updated records
+*for the object type being sent*. The top-level stats on a tracker import
+report sum tracked entities, enrollments and events, so a participant batch
+is checked against the `TRACKED_ENTITY` breakdown. Nothing is marked complete
+on the strength of having been sent.
+
+**Events carry derived UIDs.** Build them with `common.dhis2.assign_event_uids`
+or `generate_uid`, and send with `CREATE_AND_UPDATE`. A plain `CREATE` has
+nothing to match on and duplicates on every retry.
 
 **Checkpoints record outcomes.** `common.checkpoint.Checkpoint` marks a
 participant done only after a confirmed write, and records failures so the
 next run retries them.
 
-**A tracker UPDATE replaces an event's data values.** Always build the payload
-with `common.dhis2.merge_data_values`, which merges your change into the
-event's existing values. Sending only the changed value risks dropping
-everything else on the event.
+**Build event updates with `common.dhis2.merge_data_values`.** It carries the
+event's existing values alongside the change, so the payload is correct
+whether the server replaces or merges the set. DHIS2 2.44 merges, which means
+omitting an element never clears it: pass `None` for an element and the helper
+sends it with an empty value, which is the only way to remove one.
+
+**Metadata names are matched dash-insensitively.** The server holds
+"Cardiac – 12-Lead ECG" with an en dash. `lookup_by_name` falls back to a
+normalised comparison, and `common.metadata_uids` refuses to load if two
+stages differ only by dash or case, since that is what a duplicate created by
+an exact-match re-run looks like.
 
 **Everything is UTC.** The wearable and CGM files carry a `Z`, and the
 environment CSVs carry no suffix but are UTC too. Both were confirmed by
@@ -172,12 +206,21 @@ These are properties of the source data, verified against
 
 ## Security
 
-The DHIS2 admin password was committed in the initial commit and has since
-been rotated. `.gitignore` now covers `.env`, checkpoints, logs and any
-dataset file. Before committing:
+The initial commit (`55ef535`) contained the DHIS2 admin password, the full
+`registry_master_v3.csv` with 2,280 participant rows, two affected-patient
+lists and the import checkpoints. The password has been rotated. The data is
+still in the history of the public remote and its fork until the history is
+rewritten, force-pushed, and GitHub is asked to purge the fork and cached
+views. That is tracked outside this README.
+
+`.gitignore` covers `.env`, checkpoints, logs, the affected-patient lists
+and any dataset file. `nbstripout` strips notebook outputs on commit. Before
+committing:
 
 ```bash
 git diff --cached | grep -iE "password|secret|token"
+git diff --cached --stat | grep -iE "ipynb|csv|json"
 ```
 
-The AI-READI dataset is access-controlled. Do not commit any part of it.
+The AI-READI dataset is access-controlled. Do not commit any part of it,
+including in notebook outputs.

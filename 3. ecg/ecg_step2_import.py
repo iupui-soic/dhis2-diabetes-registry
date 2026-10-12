@@ -23,6 +23,10 @@ WHAT THE AUDIT FOUND (C-01, H-01, H-05, M-07), and what changed
 
 4. C-01: credentials and the dataset root come from the environment.
 
+5. Events now carry a UID derived from person, stage and header path and go
+   out with CREATE_AND_UPDATE, so a re-run updates rather than duplicates.
+   A participant with no tracked entity is recorded as skipped, not done.
+
 Verified against the real headers: every key read here is present, for example
 "# Rate: 78", "# QRSD: 83", "# validation_date: 20241014".
 
@@ -173,6 +177,8 @@ def build_event(registry, stage_uid, context, row, visit_date):
             data_values.append(entry)
 
     return {
+        "event": dhis2.generate_uid("ecg", context["trackedEntity"], stage_uid,
+                                    row["wfdb_hea_filepath"]),
         "program": M.PROGRAM_UID,
         "programStage": stage_uid,
         "trackedEntity": context["trackedEntity"],
@@ -214,7 +220,7 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    checkpoint.mark_skipped(person_id, "no tracked entity")
                     continue
 
                 visit_date = visit_dates.get(person_id)
@@ -229,7 +235,7 @@ def main():
                         skipped[reason] = skipped.get(reason, 0) + 1
 
                 if events:
-                    dhis2.send_events(session, events, "CREATE", batch_size=100)
+                    dhis2.send_events(session, events, "CREATE_AND_UPDATE", batch_size=100)
                 checkpoint.mark_done(person_id)
 
             except Exception as exc:

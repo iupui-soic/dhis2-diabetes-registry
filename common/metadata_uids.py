@@ -158,16 +158,7 @@ UNRECORDED_STAGES = [
     "Diagnosis History",
 ]
 
-# Object names on the server mix dash characters: "Wearable – Heart Rate"
-# uses an en dash, while "Cardiac – 12-Lead ECG" uses an en dash AND a hyphen
-# in the same name. Normalise every dash to one character on both sides
-# before comparing, rather than rewriting one into the other, which would
-# also rewrite the hyphen in "12-Lead".
-_DASHES = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
-
-
-def _normalise(name):
-    return "".join("-" if ch in _DASHES else ch for ch in name).casefold()
+_normalise = dhis2.normalise_name
 
 
 class Registry:
@@ -258,11 +249,29 @@ def _fetch(session):
         {"fields": "programStages[id,name,programStageDataElements[dataElement[id,name]]]"},
     )
     stages, elements = {}, {}
+    by_key = {}
     for stage in program.get("programStages", []):
         stages[stage["name"]] = stage["id"]
+        by_key.setdefault(_normalise(stage["name"]), []).append(stage)
         for psde in stage.get("programStageDataElements", []):
             de = psde["dataElement"]
             elements[de["name"]] = de["id"]
+
+    # Two stages whose names differ only by dash character or case are almost
+    # certainly a step-1 re-run that missed the existing one. Resolving either
+    # by name would then be a coin toss, so refuse until it is cleaned up.
+    duplicates = {k: v for k, v in by_key.items() if len(v) > 1}
+    if duplicates:
+        lines = []
+        for group in duplicates.values():
+            for stage in group:
+                n = len(stage.get("programStageDataElements", []))
+                lines.append(f"  {stage['id']}  {stage['name']!r}  ({n} data elements)")
+        raise dhis2.Dhis2Error(
+            "the program has stages that are the same name apart from dashes or case. "
+            "Delete the empty duplicate (usually the one with 0 data elements and no "
+            "events) and refresh the cache:\n" + "\n".join(lines)
+        )
 
     # Option codes are read from the server, never derived. The codes already
     # in use here are plain (WITHIN_RANGE), and a script that invented its own
@@ -296,6 +305,48 @@ def load(session=None, refresh=False):
     return Registry(stages, elements, option_sets)
 
 
+def verify_constants(registry):
+    """Compare the hardcoded UIDs above with what the server resolves by name.
+
+    The constants exist because they were transcribed from the scripts that
+    created the objects. On any other server, or after a metadata reset,
+    they are wrong, and nothing else would notice until data landed in the
+    wrong stage. Returns a list of human-readable mismatches.
+    """
+    problems = []
+    live_stage_uids = set(registry.stages.values())
+    for name, uid in WEARABLE_STAGE_UIDS.items():
+        try:
+            resolved = registry.stage(name)
+        except KeyError:
+            problems.append(f"stage {name!r}: constant {uid}, not on server")
+            continue
+        if resolved != uid:
+            problems.append(f"stage {name!r}: constant {uid}, server {resolved}")
+    for label, uid in (("ECG_STAGE_UID", ECG_STAGE_UID),
+                       ("RETINAL_PHOTOGRAPHY_STAGE_UID", RETINAL_PHOTOGRAPHY_STAGE_UID),
+                       ("RETINAL_OCTA_STAGE_UID", RETINAL_OCTA_STAGE_UID)):
+        if uid not in live_stage_uids:
+            problems.append(f"{label} {uid} is not a stage of program {PROGRAM_UID}")
+
+    live_de_uids = set(registry.data_elements.values())
+    constants = {
+        "HOUR_START_DE": HOUR_START_DE, "HOUR_END_DE": HOUR_END_DE,
+        "SLEEP_DURATION_DE": SLEEP_DURATION_DE,
+        "ECG_VALIDATION_DATE_DE": ECG_VALIDATION_DATE_DE,
+    }
+    constants.update({f"GLUCOSE_FIELD_UIDS[{k}]": v for k, v in GLUCOSE_FIELD_UIDS.items()})
+    constants.update({f"ENV_HUMIDITY_EXTRA_UIDS[{k}]": v for k, v in ENV_HUMIDITY_EXTRA_UIDS.items()})
+    constants.update({f"RETINAL_PHOTOGRAPHY_FIELD_UIDS[{k}]": v
+                      for k, v in RETINAL_PHOTOGRAPHY_FIELD_UIDS.items()})
+    constants.update({f"RETINAL_OCTA_FIELD_UIDS[{k}]": v
+                      for k, v in RETINAL_OCTA_FIELD_UIDS.items() if v})
+    for label, uid in constants.items():
+        if uid not in live_de_uids:
+            problems.append(f"data element {label} = {uid} is not on any stage of the program")
+    return problems
+
+
 def _main():
     import argparse
     parser = argparse.ArgumentParser(description="Rebuild the metadata UID cache")
@@ -311,6 +362,16 @@ def _main():
         print(f"\nnot found on the server ({len(missing)}):")
         for name in missing:
             print(f"  {name}")
+
+    problems = verify_constants(registry)
+    if problems:
+        print(f"\nWARNING: {len(problems)} recorded UID(s) in common/metadata_uids.py do "
+              f"not match this server. Scripts that use the constant will write to "
+              f"the wrong place or fail:")
+        for line in problems:
+            print(f"  {line}")
+    else:
+        print("\nrecorded stage and data element UIDs all match the server")
     print(f"\ncache written to {os.path.normpath(CACHE_FILE)}")
 
 

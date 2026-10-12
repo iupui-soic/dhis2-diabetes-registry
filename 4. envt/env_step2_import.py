@@ -15,6 +15,10 @@ WHAT THE AUDIT FOUND (C-01, H-05, H-06, M-20), and what changed
    server's timezone. read_env_csv now stamps UTC, so all modalities
    serialise identically.
 
+4. Events now carry a UID derived from participant, stage and hour and go out
+   with CREATE_AND_UPDATE, so a re-run updates rather than duplicates. A
+   participant with no tracked entity is recorded as skipped, not done.
+
 USAGE
 -----
     nohup python3 "4. envt/env_step2_import.py" > env_import.log 2>&1 &
@@ -103,7 +107,9 @@ def build_events(config, context, rows):
                 "status": "COMPLETED",
                 "dataValues": data_values,
             })
-    return events
+    return dhis2.assign_event_uids(
+        events, lambda e: ("env", e["trackedEntity"], e["programStage"], e["occurredAt"])
+    )
 
 
 def main():
@@ -133,7 +139,7 @@ def main():
                     session, M.PROGRAM_UID, M.PERSON_ID_ATTR_UID, person_id
                 )
                 if context is None:
-                    checkpoint.mark_done(person_id, note="no tracked entity")
+                    checkpoint.mark_skipped(person_id, "no tracked entity")
                     continue
 
                 rows = []
@@ -144,7 +150,8 @@ def main():
 
                 events = build_events(config, context, rows) if rows else []
                 if events:
-                    dhis2.send_events(session, events, "CREATE", batch_size=BATCH_SIZE)
+                    dhis2.send_events(session, events, "CREATE_AND_UPDATE",
+                                      batch_size=BATCH_SIZE)
                 checkpoint.mark_done(person_id)
                 print(f"[{index}/{len(remaining)}] {person_id}: {len(events)} events, "
                       f"{time.time() - t0:.1f}s (total {(time.time() - start) / 3600:.2f}h)")
