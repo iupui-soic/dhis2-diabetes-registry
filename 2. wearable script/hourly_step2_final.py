@@ -207,11 +207,16 @@ def main():
                 events = build_events(
                     config, context, person_id, wam.get(person_id, []), bg.get(person_id, [])
                 )
+                # Events loaded before derived UIDs existed carry server UIDs;
+                # match them by stage and hour so this run updates in place.
+                reconciler = dhis2.EventReconciler(session, M.PROGRAM_UID, dhis2.hour_identity)
                 if events:
+                    reconciler.apply(events)
                     dhis2.send_events(session, events, "CREATE_AND_UPDATE",
                                       batch_size=BATCH_SIZE)
                 checkpoint.mark_done(person_id)
-                print(f"[{index}/{len(remaining)}] {person_id}: {len(events)} events, "
+                print(f"[{index}/{len(remaining)}] {person_id}: {len(events)} events "
+                      f"({reconciler.summary()}), "
                       f"{time.time() - t0:.1f}s (total {(time.time() - start) / 3600:.2f}h)")
 
             except Exception as exc:

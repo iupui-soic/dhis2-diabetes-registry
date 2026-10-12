@@ -31,9 +31,9 @@ from common import metadata_uids as M  # noqa: E402
 
 from import_data import STAGE_FIELDS  # noqa: E402
 
-# CSV column -> tracked entity attribute display name. The ten attributes on
-# the program are listed in "7. verification data script/UID nb.ipynb".
-# person_id is written separately by import_data.py and is not listed here.
+# CSV column -> tracked entity attribute display name, confirmed against the
+# live program inventory. person_id is written separately by import_data.py
+# and "Recommended ML Train/Val/Test Split" is not imported from the CSV.
 ATTRIBUTE_NAMES = {
     "year_of_birth": "Year of Birth",
     "cl_maristat": "Marital Status",
@@ -46,45 +46,48 @@ ATTRIBUTE_NAMES = {
 }
 
 # Stage key used by import_data.STAGE_FIELDS -> stage name on the server.
-# Only "CGM Summary" and its three data elements are confirmed from the UID
-# inventory notebook. The vitals and survey names below are placeholders:
-# run --inventory and correct them. The script refuses to write until every
-# name resolves, so a wrong guess cannot produce a wrong lookup file.
+# Confirmed against the live program inventory on 2026-10-12. import_data.py
+# loads only these three stages; the other core stages (Clinical Laboratory &
+# Assessment Measurements, Medications, Device & Sensor Metadata) were
+# populated by "adding raw reading metadata 1027.ipynb" and are not part of
+# step 0.
 STAGE_NAMES = {
-    "vitals": "Baseline Vitals",
-    "survey": "Health Survey",
+    "vitals": "Vitals & Measurements",
+    "survey": "Health & Lifestyle Survey",
     "cgm": "CGM Summary",
 }
 
-# CSV column -> data element name, for the three core stages. Where the
-# server names differ from these, fix the right-hand side; --inventory prints
-# every data element on each stage.
+# CSV column -> data element name, confirmed against the inventory and against
+# the values stored for a loaded participant. The survey stage also carries
+# raw-named elements (pxfi1, sualckncf, dmlact, ...) added later by the raw
+# metadata notebook; import_data.py writes the curated names below, so those
+# raw elements must not be mapped here.
 DATA_ELEMENT_NAMES = {
-    "bp1_sysbp_vsorres": "Systolic (mmHg)",
-    "bp1_diabp_vsorres": "Diastolic (mmHg)",
-    "pulse_vsorres": "Heart Rate (bpm)",
+    "bp1_sysbp_vsorres": "Systolic Blood Pressure",
+    "bp1_diabp_vsorres": "Diastolic Blood Pressure",
+    "pulse_vsorres": "Heart Rate",
     "height_vsorres": "Height (cm)",
-    "weight_vsorres": "Weight (kilograms)",
+    "weight_vsorres": "Weight (kg)",
     "bmi_vsorres": "BMI",
     "waist_vsorres": "Waist Circumference (cm)",
     "hip_vsorres": "Hip Circumference (cm)",
-    "whr_vsorres": "Waist-Hip Ratio",
-    "mhoccur_hbp": "History - High Blood Pressure",
-    "mhoccur_clsh": "History - High Cholesterol",
-    "mhoccur_obs": "History - Obesity",
-    "mhoccur_mi": "History - Myocardial Infarction",
-    "mhoccur_strk": "History - Stroke",
-    "mhoccur_circ": "History - Circulation Problems",
-    "mhoccur_pdr": "History - Diabetic Retinopathy",
+    "whr_vsorres": "Waist-to-Hip Ratio",
+    "mhoccur_hbp": "High Blood Pressure History",
+    "mhoccur_clsh": "High Cholesterol History",
+    "mhoccur_obs": "Obesity History",
+    "mhoccur_mi": "Heart Attack History",
+    "mhoccur_strk": "Stroke History",
+    "mhoccur_circ": "Circulation Problems",
+    "mhoccur_pdr": "Diabetic Retinopathy",
     "dmlact": "Typical Activity Level",
-    "sualckncf": "Alcohol Use",
-    "susmkncf": "Smoking Status",
-    "susmkcdur": "Smoking Duration",
-    "pxfi1": "Food Insecurity 1",
-    "pxfi2": "Food Insecurity 2",
-    "pxfi3": "Food Insecurity 3",
-    "pxfi4": "Food Insecurity 4",
-    "pxfi5": "Food Insecurity 5",
+    "sualckncf": "Ever Consumed Alcohol",
+    "susmkncf": "Smoked 100+ Cigarettes Lifetime",
+    "susmkcdur": "Currently Smokes",
+    "pxfi1": "Food Security Q1",
+    "pxfi2": "Food Security Q2",
+    "pxfi3": "Food Security Q3",
+    "pxfi4": "Food Security Q4",
+    "pxfi5": "Food Security Q5",
     "average_glucose_level_mg_dl": "Average Glucose Level (mg/dL)",
     "glucose_level_record_count": "Glucose Reading Count",
     "glucose_sensor_sampling_duration_days": "Sensor Wear Duration (days)",
@@ -117,8 +120,8 @@ def print_inventory(program):
 
 
 def resolve(program):
-    """Build the lookup, returning (lookup, problems)."""
-    problems = []
+    """Build the lookup, returning (lookup, problems, warnings)."""
+    problems, warnings = [], []
     norm = dhis2.normalise_name
 
     attrs = {norm(i["trackedEntityAttribute"]["name"]): i["trackedEntityAttribute"]
@@ -129,10 +132,13 @@ def resolve(program):
     if person is None:
         problems.append(f"person_id attribute {M.PERSON_ID_ATTR_UID} is not on the program")
     elif not person.get("unique"):
-        problems.append(
+        # A server setting, not a mapping error, so it does not block the
+        # file. send_to_dhis2.py and get_tei_context guard against duplicates
+        # in code, but the server itself only refuses them once this is set.
+        warnings.append(
             f"attribute {person['name']!r} is not flagged unique. Without that the "
             f"server accepts two participants with the same person_id. Set it in "
-            f"Maintenance > Tracked entity attribute."
+            f"Maintenance > Tracked entity attribute > AI-READI Person ID > Unique."
         )
 
     attribute_uid_by_field = {}
@@ -178,7 +184,7 @@ def resolve(program):
     }
     if not lookup["tracked_entity_type_uid"]:
         problems.append("program has no tracked entity type")
-    return lookup, problems
+    return lookup, problems, warnings
 
 
 def main():
@@ -195,7 +201,9 @@ def main():
         print_inventory(program)
         return 0
 
-    lookup, problems = resolve(program)
+    lookup, problems, warnings = resolve(program)
+    for line in warnings:
+        print(f"WARNING: {line}\n")
     if problems:
         print(f"{len(problems)} name(s) did not resolve. Nothing written.\n")
         for line in problems:

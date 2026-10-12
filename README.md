@@ -25,9 +25,15 @@ the shell mangles any password containing `&` or `$`, and the variable arrives
 empty, which looks exactly like a missing credential.
 
 `.env` needs a DHIS2 URL, a write account for the metadata and import steps,
-optionally a read-only auditor account for the verification scripts, and the
-dataset root. On the JupyterHub server the dataset is at
-`/data0/AI-READI/full_subset`.
+a read-only auditor account for the verification scripts, and the dataset
+root. On the JupyterHub server the dataset is at `/data0/AI-READI/full_subset`.
+
+The server has an `Auditor` role with search, view and export authorities and
+nothing that writes. Create a user with only that role (Users app > Add,
+assign the registry org unit) and put it in `DHIS2_AUDITOR_USER` and
+`DHIS2_AUDITOR_PASS`. Without those two, `get_session(read_only=True)` falls
+back to the write account and the verification scripts are no longer unable
+to write.
 
 `nbstripout` installs a git filter that drops notebook outputs on commit.
 Notebook outputs in this repository have held participant rows before, and
@@ -57,13 +63,20 @@ and every event it creates carries a UID derived from its source identity
 (participant, stage and hour, or SOP Instance UID), sent with
 CREATE_AND_UPDATE. Re-running a step, resuming after a kill, or retrying after
 a proxy timeout therefore updates the same events rather than duplicating them.
+Events loaded before derived UIDs existed carry server-assigned UIDs, so each
+step-2 script first matches the participant's existing events by identity and
+reuses their UIDs (`common.dhis2.EventReconciler`). Verified on participant
+1072: a re-run over 3,798 existing events updated every one in place and
+created none.
 
 ```bash
 # 0. Core registry. Do this first: everything else attaches to these entities.
 #    The program, its attributes and its three core stages were built in the
 #    Maintenance app and are not created by any script. build_uid_lookup.py
-#    resolves their UIDs by name; --inventory shows what the server has if a
-#    name does not match.
+#    resolves their UIDs by name (confirmed against the live program on
+#    2026-10-12); --inventory shows what the server has if a name stops
+#    matching. It warns if the person_id attribute is not flagged unique;
+#    set that in Maintenance so the server itself refuses duplicates.
 python3 "1. core registry/build_uid_lookup.py"      # writes uid_lookup.json
 python3 "1. core registry/import_data.py"           # writes import_payload.json
 python3 "1. core registry/send_to_dhis2.py"         # posts it, skipping person_ids already on the server
@@ -138,6 +151,15 @@ on the strength of having been sent.
 or `generate_uid`, and send with `CREATE_AND_UPDATE`. A plain `CREATE` has
 nothing to match on and duplicates on every retry.
 
+**Existing events are matched by identity, not by UID.** Before sending,
+wrap the participant's events in `common.dhis2.EventReconciler` with an
+identity function: `hour_identity` for hourly stages, `value_identity(...)`
+on the code, label and date for a diagnosis, on the header path for an ECG,
+on the SOP Instance UID for an image. Matched events keep the server's UID
+and are updated; unmatched ones are created under their derived UID. The
+reconciler also counts server events the source no longer accounts for and
+says so in the per-participant line.
+
 **Checkpoints record outcomes.** `common.checkpoint.Checkpoint` marks a
 participant done only after a confirmed write, and records failures so the
 next run retries them.
@@ -206,12 +228,15 @@ These are properties of the source data, verified against
 
 ## Security
 
-The initial commit (`55ef535`) contained the DHIS2 admin password, the full
+The original initial commit contained the DHIS2 admin password, the full
 `registry_master_v3.csv` with 2,280 participant rows, two affected-patient
-lists and the import checkpoints. The password has been rotated. The data is
-still in the history of the public remote and its fork until the history is
-rewritten, force-pushed, and GitHub is asked to purge the fork and cached
-views. That is tracked outside this README.
+lists, the import checkpoints and notebook outputs. The password has been
+rotated. On 2026-10-12 the history was rewritten with `git filter-repo` and
+force-pushed, and every blob in every remaining commit was checked clean. Any
+clone made before that date still holds the old history: re-clone, never
+pull or merge from it. GitHub keeps serving the old commits by SHA, and the
+fork keeps its copy, until GitHub support purges them; that request is
+tracked outside this README.
 
 `.gitignore` covers `.env`, checkpoints, logs, the affected-patient lists
 and any dataset file. `nbstripout` strips notebook outputs on commit. Before

@@ -199,6 +199,8 @@ def main():
     session = dhis2.get_session()
     registry = M.load(session)
     stage_uid = registry.stage(STAGE_NAME)
+    # One ECG event per header file; match existing events by that path.
+    identity = dhis2.value_identity(registry.data_element("ECG Raw Header File Path"))
 
     manifest = aireadi.load_manifest("cardiac_ecg")
     participants = pd.read_csv(aireadi.participants_file(), sep="\t")
@@ -235,7 +237,11 @@ def main():
                         skipped[reason] = skipped.get(reason, 0) + 1
 
                 if events:
+                    reconciler = dhis2.EventReconciler(session, M.PROGRAM_UID, identity)
+                    reconciler.apply(events)
                     dhis2.send_events(session, events, "CREATE_AND_UPDATE", batch_size=100)
+                    if reconciler.unmatched_existing:
+                        print(f"  {person_id}: {reconciler.summary()}")
                 checkpoint.mark_done(person_id)
 
             except Exception as exc:

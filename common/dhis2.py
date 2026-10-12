@@ -686,7 +686,7 @@ def get_tei_context(session, program_uid, person_id_attr, person_id):
 
 
 EVENT_FIELDS = ("event,programStage,orgUnit,enrollment,trackedEntity,"
-                "occurredAt,status,dataValues[dataElement,value]")
+                "occurredAt,createdAt,status,dataValues[dataElement,value]")
 
 
 def fetch_events(session, program_uid, stage_uid, tei_uid=None, fields=EVENT_FIELDS):
@@ -695,6 +695,105 @@ def fetch_events(session, program_uid, stage_uid, tei_uid=None, fields=EVENT_FIE
     if tei_uid:
         params["trackedEntity"] = tei_uid
     return fetch_all_pages(session, "tracker/events", params, ("events", "instances"))
+
+
+def data_value_of(event, data_element_uid):
+    """The stored value of one data element on an event, or None."""
+    for entry in event.get("dataValues", []):
+        if entry.get("dataElement") == data_element_uid:
+            return entry.get("value")
+    return None
+
+
+def hour_identity(event):
+    """Identity for hourly stages: one event per stage per hour.
+
+    occurredAt is cut to the second so a built "2023-11-29T00:00:00" and a
+    stored "2023-11-29T00:00:00.000" compare equal.
+    """
+    return (event["programStage"], str(event.get("occurredAt", ""))[:19])
+
+
+def value_identity(*data_element_uids, with_date=False):
+    """Identity from the values of the given data elements.
+
+    Use this where the hour is not unique: a diagnosis is identified by its
+    code, label and date; an ECG or retinal image by its file path or SOP
+    instance UID. with_date adds the occurredAt date as a tie breaker.
+    """
+    def identity(event):
+        key = (event["programStage"],) + tuple(
+            data_value_of(event, uid) for uid in data_element_uids
+        )
+        if with_date:
+            key += (str(event.get("occurredAt", ""))[:10],)
+        return key
+    return identity
+
+
+class EventReconciler:
+    """Reuse the UIDs of events that are already on the server.
+
+    Every event loaded before the deterministic UIDs existed carries a
+    server-assigned UID, so a derived UID alone cannot find it, and a
+    CREATE_AND_UPDATE run would create a second copy of each event. Verified
+    live on participant 1072 on 2026-10-12: the first run doubled every stage.
+
+    The reconciler fetches the participant's existing events for each stage
+    once, groups them by identity (oldest first, so backfilled fields stay on
+    the event that holds them) and hands the k-th built event of an identity
+    the k-th existing UID. Built events with no match keep their derived UID
+    and are created. Existing events with no built counterpart are left alone
+    and counted in `unmatched_existing`; a non-zero count means the server
+    holds events the source files no longer account for and deserves a look.
+    """
+
+    def __init__(self, session, program_uid, identity_fn):
+        self.session = session
+        self.program_uid = program_uid
+        self.identity_fn = identity_fn
+        self._existing = {}       # (trackedEntity, programStage) -> {identity: [uid, ...]}
+        self._consumed = {}       # (trackedEntity, programStage) -> {identity: n used}
+        self.reused = 0
+        self.created = 0
+        self.unmatched_existing = 0
+
+    def _index(self, tei_uid, stage_uid):
+        key = (tei_uid, stage_uid)
+        if key not in self._existing:
+            events = fetch_events(self.session, self.program_uid, stage_uid, tei_uid)
+            events.sort(key=lambda e: (e.get("createdAt") or "", e["event"]))
+            index = {}
+            for existing in events:
+                index.setdefault(self.identity_fn(existing), []).append(existing["event"])
+            self._existing[key] = index
+            self._consumed[key] = {}
+            self.unmatched_existing += len(events)
+        return self._existing[key], self._consumed[key]
+
+    def apply(self, events):
+        """Rewrite event UIDs in place. Returns the same list."""
+        for event in events:
+            index, consumed = self._index(event["trackedEntity"], event["programStage"])
+            identity = self.identity_fn(event)
+            n = consumed.get(identity, 0)
+            consumed[identity] = n + 1
+            pool = index.get(identity, [])
+            if n < len(pool):
+                event["event"] = pool[n]
+                self.reused += 1
+                self.unmatched_existing -= 1
+            else:
+                self.created += 1
+        check_unique_uids(events, "event")
+        return events
+
+    def summary(self):
+        text = f"{self.reused} existing, {self.created} new"
+        if self.unmatched_existing:
+            text += (f", WARNING {self.unmatched_existing} server event(s) not "
+                     f"accounted for by the source")
+        return text
 
 
 def merge_data_values(event, updates):

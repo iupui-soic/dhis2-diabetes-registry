@@ -138,6 +138,9 @@ def main():
         "date": registry.data_element("Diagnosis Date"),
     }
 
+    # A diagnosis is identified by its code, label and date, not by the hour.
+    identity = dhis2.value_identity(field_uids["code"], field_uids["label"], field_uids["date"])
+
     conditions = pd.read_csv(aireadi.clinical_file("condition_occurrence.csv"))
     conditions["person_id"] = conditions["person_id"].astype(str)
     by_person = dict(tuple(conditions.groupby("person_id")))
@@ -171,8 +174,12 @@ def main():
                     skipped_total[reason] = skipped_total.get(reason, 0) + count
 
                 if events:
+                    reconciler = dhis2.EventReconciler(session, M.PROGRAM_UID, identity)
+                    reconciler.apply(events)
                     dhis2.send_events(session, events, "CREATE_AND_UPDATE",
                                       batch_size=BATCH_SIZE)
+                    if reconciler.unmatched_existing:
+                        print(f"  {person_id}: {reconciler.summary()}")
                 checkpoint.mark_done(person_id)
 
             except Exception as exc:

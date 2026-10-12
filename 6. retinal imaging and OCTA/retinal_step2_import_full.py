@@ -160,7 +160,7 @@ def build_event(stage_uid, context, occurred_at, values, identity):
 
 
 def import_photography(session, fields, stage_uid, context, rows,
-                       occurred_at, checkpoint):
+                       occurred_at, checkpoint, reconciler):
     created, failed = 0, 0
     for row in rows:
         identity = row.get("sop_instance_uid")
@@ -187,6 +187,7 @@ def import_photography(session, fields, stage_uid, context, rows,
             (fields["filepath"], row.get("filepath")),
             (fields["preview"], preview_uid),
         ], identity)
+        reconciler.apply([event])
         dhis2.send_events(session, [event], "CREATE_AND_UPDATE")
         if reason:
             # Metadata is on the server; the preview is not. Leave the row
@@ -199,7 +200,8 @@ def import_photography(session, fields, stage_uid, context, rows,
     return created, failed
 
 
-def import_octa(session, fields, stage_uid, context, rows, occurred_at, checkpoint):
+def import_octa(session, fields, stage_uid, context, rows, occurred_at, checkpoint,
+                reconciler):
     created, failed = 0, 0
     for row in rows:
         identity = row.get("flow_cube_sop_instance_uid")
@@ -237,10 +239,9 @@ def import_octa(session, fields, stage_uid, context, rows, occurred_at, checkpoi
         if fields.get("enface_file_path"):
             values.append((fields["enface_file_path"], enface_path))
 
-        dhis2.send_events(
-            session, [build_event(stage_uid, context, occurred_at, values, identity)],
-            "CREATE_AND_UPDATE",
-        )
+        event = build_event(stage_uid, context, occurred_at, values, identity)
+        reconciler.apply([event])
+        dhis2.send_events(session, [event], "CREATE_AND_UPDATE")
         if reason:
             checkpoint.mark_failed(key, reason)
             failed += 1
@@ -274,6 +275,19 @@ def main():
 
     photo_stage = registry.stage(PHOTO_STAGE)
     octa_stage = registry.stage(OCTA_STAGE)
+
+    # Events loaded before derived UIDs existed carry server UIDs. An image
+    # is identified by its SOP instance UID (the flow cube's, for OCTA), so
+    # match on that and update the existing event instead of adding a copy.
+    photo_identity = dhis2.value_identity(photo_fields["sop_instance_uid"])
+    octa_identity = dhis2.value_identity(octa_fields["flow_cube_sop_instance_uid"])
+
+    def retinal_identity(event):
+        if event["programStage"] == photo_stage:
+            return photo_identity(event)
+        return octa_identity(event)
+
+    reconciler = dhis2.EventReconciler(session, M.PROGRAM_UID, retinal_identity)
 
     # M-01: read each manifest once, then group.
     print("Reading manifests")
@@ -312,11 +326,11 @@ def main():
             try:
                 created, failed = import_photography(
                     session, photo_fields, photo_stage, entry,
-                    photo_rows.get(person_id, []), occurred_at, checkpoint,
+                    photo_rows.get(person_id, []), occurred_at, checkpoint, reconciler,
                 )
                 octa_created, octa_failed = import_octa(
                     session, octa_fields, octa_stage, entry,
-                    octa_rows.get(person_id, []), occurred_at, checkpoint,
+                    octa_rows.get(person_id, []), occurred_at, checkpoint, reconciler,
                 )
                 created += octa_created
                 failed += octa_failed
@@ -339,7 +353,7 @@ def main():
                       f"{elapsed:.1f} min elapsed, ETA {eta:.0f} min, "
                       f"{len(checkpoint.failed)} failed")
 
-    print(f"\nRun complete. {checkpoint.summary()}")
+    print(f"\nRun complete. {checkpoint.summary()}; events: {reconciler.summary()}")
     return 1 if checkpoint.failed else 0
 
 
